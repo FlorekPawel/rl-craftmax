@@ -258,12 +258,37 @@ def test_yaml_floats_without_a_dot_are_floats() -> None:
         {"grid": {"coarse": [{"lr": 1}]}},
         {"grid": {"coarse": [{"name": "a"}, {"name": "a"}]}},
         {"grid": {"coarse": [{"name": "tuned"}]}},
+        {"abort": {"nan": True}},
+        {"abort": {"finite": "ppo/value_loss"}},
+        {"abort": {"finite": [1]}},
+        {"abort": {"flags": [{"name": "a", "metric": "m"}]}},
+        {"abort": {"flags": [{"name": "a", "metric": "m", "above": 1, "below": 0}]}},
+        {"abort": {"flags": [{"name": "a", "metric": "m", "above": 1, "x": 0}]}},
+        {"abort": {"flags": [{"name": "a", "metric": "m", "above": 1, "updates": 0}]}},
+        {"abort": {"flags": [{"name": "a", "metric": "m", "above": 1, "before": 2}]}},
+        {"abort": {"flags": [{"metric": "m", "above": 1}]}},
+        {"abort": {"flags": [{"name": "a", "metric": "m", "above": 1}] * 2}},
     ],
 )
 def test_method_yaml_fails_loudly(tmp_path: Path, edit: dict[str, Any]) -> None:
     (tmp_path / "bad.yaml").write_text(yaml.safe_dump({"base": {"env": "X"}, **edit}))
     with pytest.raises(ValueError, match="bad"):
         load_method("bad", tmp_path)
+
+
+def test_the_abort_block_reaches_every_spec_of_the_method() -> None:
+    flags = load_method("toy", METHODS).abort["flags"]  # type: ignore[index]
+    assert [f["name"] for f in flags] == [
+        "kl_high",
+        "entropy_collapse",
+        "value_failure",
+    ]
+    specs = phase("entries")
+    toy = [s for s in specs if s.registry_name == "toy"]
+    assert toy
+    assert all(s.abort["flags"] == flags for s in toy)  # type: ignore[index]
+    assert all(s.abort["finite"] == ["ppo/value_loss"] for s in toy)  # type: ignore[index]
+    assert all(s.abort is None for s in specs if s.registry_name != "toy")
 
 
 def test_base_from_resolves_the_donor_tuned_block_plus_own_keys() -> None:
@@ -769,3 +794,42 @@ def test_shipped_ppo_base_is_the_craftax_1m_table_11() -> None:
         "resets": "optimistic",
         "reset_ratio": 16,
     }
+
+
+def test_shipped_ppo_abort_flags_are_the_plans_thresholds() -> None:
+    abort = load_method("ppo", REPO / "configs/methods").abort
+    assert abort == {
+        "finite": ["ppo/policy_loss", "ppo/value_loss"],
+        "flags": [
+            {"name": "kl_high", "metric": "ppo/approx_kl", "above": 0.1, "updates": 3},
+            {
+                "name": "entropy_collapse",
+                "metric": "ppo/entropy",
+                "below": 0.2,
+                "before": 0.1,
+            },
+            {
+                "name": "value_failure",
+                "metric": "ppo/explained_variance",
+                "below": 0.0,
+                "after": 0.2,
+                "updates": 5,
+            },
+        ],
+    }
+
+
+def test_shipped_tune_coarse_phase_is_the_28_run_ppo_stage_1() -> None:
+    specs = expand_phase(REPO / "configs/phases/tune-coarse.yaml")
+    assert len(specs) == 28
+    assert {(s.registry_name, s.budget, s.env) for s in specs} == {
+        ("ppo", "1m", "Craftax-Symbolic-v1")
+    }
+    assert {s.eval_mode for s in specs} == {"final"}
+    by_config = {}
+    for s in specs:
+        by_config.setdefault(s.config_hash, []).append(s.seed)
+    assert sorted(len(v) for v in by_config.values()) == [3] * 6 + [10]
+    method = load_method("ppo", REPO / "configs/methods")
+    published = resolve_config(method, "ppo", "1m", ref="published-1m")
+    assert by_config[config_hash(published)] == list(range(10))
