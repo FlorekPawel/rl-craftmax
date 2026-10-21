@@ -1,18 +1,109 @@
-# wut_murl_craftax
+<div align="center">
+  <h1>wut_murl_craftax</h1>
+  <p><strong>Textbook reinforcement learning on Craftax, measured beyond the score.</strong></p>
+  <p>Course project for <em>Mathematical Underpinning of Reinforcement Learning</em> (MURL), Warsaw University of Technology.</p>
+  <p>
+    <a href="https://github.com/Pawlo77/wut_murl_craftax/actions/workflows/test.yaml"><img src="https://github.com/Pawlo77/wut_murl_craftax/actions/workflows/test.yaml/badge.svg" alt="Pytest"></a>
+    <a href="https://github.com/Pawlo77/wut_murl_craftax/actions/workflows/prek.yaml"><img src="https://github.com/Pawlo77/wut_murl_craftax/actions/workflows/prek.yaml/badge.svg" alt="Prek Checks"></a>
+    <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python 3.12"></a>
+    <a href="https://github.com/MichaelTMatthews/Craftax"><img src="https://img.shields.io/badge/env-Craftax%201.6.1-green.svg" alt="Craftax 1.6.1"></a>
+    <a href="https://github.com/jax-ml/jax"><img src="https://img.shields.io/badge/JAX-0.11-orange.svg" alt="JAX 0.11"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  </p>
+</div>
 
-Reinforcement learning on Craftax
+## About
 
-## Development
+[Craftax](https://github.com/MichaelTMatthews/Craftax) is a fast, open-ended survival and crafting game written in JAX: 67 achievements across 9 floors, sparse rewards and a partial view of the world. This project trains three published agents as controls and four textbook-level methods on it, at the two scoreboard budgets (1M and 1B environment steps), and asks how they learn, not only how much they score:
+
+- **Learning:** stability across seeds, hyperparameter sensitivity, hardware use.
+- **Playing:** which agent unlocks an achievement first, in which order, how deep it gets, how it dies, explores, fights and survives.
+- **Explaining:** how complex each final policy's decision rules are (decision-tree distillation).
+- **Showing:** GIFs and YouTube videos of the learning process and the most interesting moments.
+
+## Results
+
+- Hugging Face Space: [`Pawlo77/wut-murl-craftax`](https://huggingface.co/spaces/Pawlo77/wut-murl-craftax).
+- MLflow runs and checkpoints: [`Pawlo77/wut-murl-craftax-results`](https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results).
+
+## Methods
+
+| Method | Role | Family |
+|---|---|---|
+| PPO | control | policy gradient |
+| PPO-RNN | control | policy gradient with memory |
+| PQN-RNN | control | value-based, Q(λ) |
+| Count-Based Progress Bonus | add-on to PPO-RNN and PQN-RNN | exploration bonus |
+| Self-Imitation Learning | add-on to PPO-RNN | learning from own successes |
+| SMDP Q-Learning over Hand-Defined Skills | method | hierarchical RL |
+| Dyna-Q over a Skill-Level Progress Model | method | model-based planning |
+
+The skill methods use hand-written skills and are reported separately.
+
+## Installation
+
+Requires Python 3.12 and [uv](https://docs.astral.sh/uv/); `ffmpeg` on `PATH` for videos.
 
 ```bash
-make install
-make check
+git clone https://github.com/Pawlo77/wut_murl_craftax.git
+cd wut_murl_craftax
+make install          # uv sync: Craftax, JAX, Apple GPU (metaljax) or CUDA backend
+make warm             # build the Craftax texture caches, print the devices in use
+cp .env.example .env  # persistent XLA compilation cache for every make target
 ```
 
-Run `make help` for all targets.
+On Apple Silicon, environments step fastest on the CPU and network updates on the GPU; on CUDA everything runs on the GPU.
+
+## Quickstart
+
+```bash
+make train-ppo ARGS="--env Craftax-Classic-Symbolic-v1 --steps 1e6"   # baseline PPO with checkpoints
+make vis STEP=review ARGS="--help"                                      # one visualisation step
+make help                                                               # every target
+```
+
+Runs are logged to MLflow; `make mlflow` opens the UI.
+
+## Project map
+
+| Where | What |
+|---|---|
+| [`src/wut_murl_craftax/`](src/wut_murl_craftax) | `orchestration` (runtime, MLflow), `training` (agents), `visualisation` (videos, charts) |
+| [`report/`](report) | the checkpoint report, its figures, tables and number macros |
+| `configs/`, `outputs/` | experiment configs; generated outputs (git-ignored) |
+
+Development: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Acknowledgements
+
+- [Craftax](https://github.com/MichaelTMatthews/Craftax) (MIT): the environment.
+- [Craftax_Baselines](https://github.com/MichaelTMatthews/Craftax_Baselines) (MIT): the PPO and PPO-RNN baselines our controls are adapted from.
+- [purejaxql](https://github.com/mttga/purejaxql) (Apache-2.0): the PQN-RNN reference implementation.
+- R. S. Sutton and A. G. Barto, *Reinforcement Learning: An Introduction*: the methods' foundations.
+
+## Citing
+
+Please cite this repository ([`CITATION.cff`](CITATION.cff)) and Craftax:
+
+```bibtex
+@misc{pozorski2026wutmurlcraftax,
+  author = {Pozorski, Pawe{\l}},
+  title = {wut\_murl\_craftax: Textbook reinforcement learning on Craftax},
+  year = {2026},
+  howpublished = {\url{https://github.com/Pawlo77/wut_murl_craftax}},
+  note = {Course project, Mathematical Underpinning of Reinforcement Learning, Warsaw University of Technology}
+}
+
+@inproceedings{matthews2024craftax,
+  author = {Michael Matthews and Michael Beukman and Benjamin Ellis and Mikayel Samvelyan and Matthew Jackson and Samuel Coward and Jakob Foerster},
+  title = {Craftax: A Lightning-Fast Benchmark for Open-Ended Reinforcement Learning},
+  booktitle = {International Conference on Machine Learning ({ICML})},
+  year = {2024}
+}
+```
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE). Third-party code keeps its own licence header.
 
 Copyright 2026 Paweł Pozorski.
