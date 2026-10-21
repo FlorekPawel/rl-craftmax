@@ -39,6 +39,7 @@ from ..orchestration import shard_envs
 from .batch_renorm import BatchRenorm
 from .hooks import (
     HOOK_NAMES,
+    MEMORY_LIMIT_KEY,
     HookFields,
     HookMethod,
     HookSpec,
@@ -68,8 +69,9 @@ LR_END = 1e-20
 """Learning rate at the end of the linear decay, as the original."""
 FILLED_LOSS_COLUMNS = ("value_loss", "grad_norm")
 """`LOSS_COLUMNS` an update fills: the TD loss and the gradient norm; others NaN."""
-_LEARNER_HOOKS = {"observe", "extra_loss_fn", "metrics_fn"}
-"""Hooks that read the method state on the learner, so it moves there each update."""
+_LEARNER_HOOKS = {"observe", "extra_loss_fn"}
+"""Hooks that read the method state on the learner, so it moves there each update;
+without them ``metrics_fn`` reads it on the actor, where the rollout keeps it."""
 _CLI_ONLY = {"seed"}
 """Fields the runner sets itself (the key), never in a config."""
 
@@ -158,12 +160,13 @@ class PQNRNNConfig(HookFields):
     def from_config(cls, config: Mapping[str, Any], base: Self | None = None) -> Self:
         """Build from a run config: its keys, ``steps`` and the registry's ``method``.
 
-        The keys override ``base`` (default: the field defaults); hooks are never keys.
+        The keys override ``base`` (default: the field defaults); hooks are never keys,
+        the runtime `MEMORY_LIMIT_KEY` is skipped.
 
         Raises:
             ValueError: On a key that is not a PQN-RNN setting.
         """
-        keys = set(config) - {"method"}
+        keys = set(config) - {"method", MEMORY_LIMIT_KEY}
         names = {f.name for f in dataclasses.fields(cls)} - _CLI_ONLY - set(HOOK_NAMES)
         if unknown := sorted(keys - names):
             msg = f"unknown PQN-RNN config keys: {unknown}"
@@ -508,8 +511,10 @@ def _make_learn(cfg: PQNRNNConfig, net: RNNQNetwork) -> Callable[..., Any]:
 def _make_finish(hk: ResolvedHooks) -> Callable[..., Any]:
     """Jitted end of an update: ``extra_steps`` extra-loss steps, then ``metrics_fn``.
 
-    Extra-loss metrics are averaged over the steps.
+    Extra-loss metrics are averaged over the steps; ``metrics_fn`` runs here only if
+    the state is on the learner.
     """
+    on_learner = bool(_LEARNER_HOOKS & set(hk.active))
     extra_grad = jax.value_and_grad(hk.extra_loss_fn, has_aux=True)
 
     def extra_step(c: tuple[QTrainState, Any, jax.Array], _: None) -> Any:
@@ -528,7 +533,8 @@ def _make_finish(hk: ResolvedHooks) -> Callable[..., Any]:
             )
             check_metric_names(em)
             method |= {k: v.mean() for k, v in em.items()}
-        method |= hk.metrics_fn(ms)
+        if on_learner:
+            method |= hk.metrics_fn(ms)
         return ts, ms, method
 
     return finish
@@ -547,6 +553,8 @@ class _Setup:
     learn: Callable[..., Any]
     observe: Callable[..., Any]
     finish: Callable[..., Any]
+    metrics: Callable[..., Any]
+    """Jitted ``metrics_fn`` on the actor, for a state that never leaves it."""
     learner: jax.Device
     actor: jax.Device
     mesh: Mesh | None
@@ -565,9 +573,16 @@ class _Setup:
         return bool(_LEARNER_HOOKS & set(self.hooks.active))
 
     @property
+    def actor_metrics(self) -> bool:
+        """Whether ``metrics_fn`` runs on the actor (the state stays there)."""
+        return "metrics_fn" in self.hooks.active and not self.learner_state
+
+    @property
     def finishes(self) -> bool:
-        """Whether an update ends with extra-loss steps or method metrics."""
-        return bool({"extra_loss_fn", "metrics_fn"} & set(self.hooks.active))
+        """Whether an update ends with extra-loss steps or learner-side metrics."""
+        return "extra_loss_fn" in self.hooks.active or (
+            "metrics_fn" in self.hooks.active and self.learner_state
+        )
 
 
 @functools.cache
@@ -575,9 +590,13 @@ def _setup(cfg: PQNRNNConfig) -> _Setup:
     """Cached per config (hooks included) so every chunk reuses the compiled steps.
 
     Raises:
-        ValueError: If the env batch does not split over the CPU devices.
+        ValueError: If the env batch does not split over the CPU devices, or a method
+            sets ``after_extra_fn``.
     """
     hk = resolve(cfg)
+    if "after_extra_fn" in hk.active:
+        msg = "after_extra_fn is a PPO-RNN hook: PQN-RNN would never call it"
+        raise ValueError(msg)
     roles, mesh, shared_at = env_placement(cfg.envs)
     wrap = hk.env_wrapper_fn if "env_wrapper_fn" in hk.active else None
     env, env_params = make_train_env(cfg, wrap)
@@ -593,6 +612,7 @@ def _setup(cfg: PQNRNNConfig) -> _Setup:
         _make_learn(cfg, net),
         jax.jit(hk.observe),
         _make_finish(hk),
+        jax.jit(hk.metrics_fn),
         roles.learner,
         roles.actor,
         mesh,
@@ -697,8 +717,13 @@ class PQNRNNState(struct.PyTreeNode):  # type: ignore[no-untyped-call]  # flax A
     cfg: PQNRNNConfig = struct.field(pytree_node=False)  # type: ignore[no-untyped-call]  # flax API
 
 
-def init_state(cfg: PQNRNNConfig, key: jax.Array) -> PQNRNNState:
-    """Fresh network on the learner, envs on the actor, then the random warm-up."""
+def init_state(
+    cfg: PQNRNNConfig, key: jax.Array, memory_limit_bytes: int | None = None
+) -> PQNRNNState:
+    """Fresh network on the learner, envs on the actor, then the random warm-up.
+
+    ``memory_limit_bytes`` goes to the method in `HookSpec`.
+    """
     s = _setup(cfg)
     key, k_init, k_reset, k_method = jax.random.split(key, 4)
     with jax.default_device(s.learner):
@@ -713,7 +738,8 @@ def init_state(cfg: PQNRNNConfig, key: jax.Array) -> PQNRNNState:
         # an array from the start, as after an update (see `ppo.init_state`)
         ts = ts.replace(step=jnp.zeros((), jnp.int32))
     n_ach = len(achievement_names(cfg.env))
-    spec = HookSpec(cfg.envs, s.net.obs_dim, s.net.n_actions, n_ach, cfg.steps)
+    dims = (cfg.envs, s.net.obs_dim, s.net.n_actions, n_ach, cfg.steps)
+    spec = HookSpec(*dims, memory_limit_bytes)
     with jax.default_device(s.actor):
         obs, st = s.env.reset(k_reset, s.env_params)
         per_env = (
@@ -818,6 +844,8 @@ def _update(
     method: dict[str, jax.Array] = {}
     if s.finishes:
         ts, ms, method = s.finish(ts, ms, k_extra)
+    if s.actor_metrics:
+        method |= s.metrics(ms)
     updates = state.updates + 1
     eps = jax.device_put(epsilon(state.cfg, updates), s.shared_at)
     state = state.replace(
@@ -929,7 +957,8 @@ class PQNRNNTrainer:
         if "steps" not in config:
             msg = "PQN-RNN schedules span the budget: pass `steps` in the config"
             raise ValueError(msg)
-        return init_state(self.config(config), key)
+        limit = config.get(MEMORY_LIMIT_KEY)
+        return init_state(self.config(config), key, limit)
 
     def train_chunk(
         self, state: PQNRNNState, n_updates: int

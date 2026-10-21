@@ -24,7 +24,7 @@ the control's graph stays as it is. `make_trainer` gives the registry's `Trainer
 """
 
 import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
@@ -41,6 +41,7 @@ from jax.sharding import Mesh, NamedSharding
 from ..evaluation.episode_metrics import EpisodeAcc, episode_step, events_of, init_acc
 from ..orchestration import shard_envs
 from .hooks import (
+    MEMORY_LIMIT_KEY,
     HookFields,
     HookMethod,
     HookSpec,
@@ -71,8 +72,11 @@ ACTIVATIONS: dict[str, Callable[[jax.Array], jax.Array]] = {
     "tanh": nn.tanh,
 }
 """``activation`` values: ReLU as the original code, tanh as the paper's text."""
-_LEARNER_HOOKS = {"observe", "extra_loss_fn", "metrics_fn"}
-"""Hooks that read the method state on the learner, so it moves there each update."""
+_LEARNER_HOOKS = {"observe", "extra_loss_fn"}
+"""Hooks that read the method state on the learner. With ``intrinsic_reward_fn`` too
+the state moves between actor and learner each update; without it the state lives on
+the learner (the rollout never reads it); with neither, ``metrics_fn`` reads it on the
+actor, where the rollout keeps it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,14 +274,64 @@ def _seq_loss(
     return ppo_terms(logits.reshape(-1, logits.shape[-1]), v.reshape(-1), flat, cfg)
 
 
+def _skip_if_zero(old: TrainState, new: TrainState, norm: jax.Array) -> TrainState:
+    """``new``, or ``old`` with only its clocks moved on when the gradient norm is 0.
+
+    A zero gradient (an extra loss with nothing to learn) would still move the params
+    on Adam's momentum, so the params and Adam's moments and count stay. The step
+    count and the schedule's count do advance, as for an applied step: the learning
+    rate stays indexed by update, aligned with the control's anneal. A NaN gradient
+    is applied, so the abort rules see it.
+    """
+    live = norm != 0
+
+    def pick(o: Any, n: Any) -> Any:
+        if isinstance(n, optax.ScaleByScheduleState):
+            return n
+        return jax.tree.map(lambda a, b: jnp.where(live, b, a), o, n)
+
+    def is_clock(x: Any) -> bool:
+        return isinstance(x, optax.ScaleByScheduleState)
+
+    opt = jax.tree.map(pick, old.opt_state, new.opt_state, is_leaf=is_clock)
+    return new.replace(params=pick(old.params, new.params), opt_state=opt)
+
+
+def _policy_kl(net: ActorCriticRNN, before: Any, after: Any, b: Batch) -> jax.Array:
+    """Mean KL(pi_before || pi_after) over the batch's steps, both rerun from ``h0``."""
+
+    def logp(params: Any) -> jax.Array:
+        _, logits, _ = apply_network(net, params, b["h0"], b["obs"], b["reset"])
+        return jax.nn.log_softmax(logits)
+
+    lb, la = logp(before), logp(after)
+    return jnp.mean(jnp.sum(jnp.exp(lb) * (lb - la), axis=-1))
+
+
+def _extra_group(names: Iterable[str]) -> str | None:
+    """The one metric group of an extra loss's names; None if it reports none.
+
+    Raises:
+        ValueError: If the names span several groups.
+    """
+    groups = {n.partition("/")[0] for n in names}
+    if len(groups) > 1:
+        msg = f"extra-loss metrics span several groups {sorted(groups)}; use one"
+        raise ValueError(msg)
+    return next(iter(groups), None)
+
+
 def _make_learn(
     cfg: PPORNNConfig, net: ActorCriticRNN, hk: ResolvedHooks
 ) -> Callable[..., Any]:
     """Jitted update: ``observe``, PPO epochs, extra-loss steps, method metrics.
 
     Returns the losses in ``records.LOSS_COLUMNS`` order and the method's metrics
-    (extra-loss metrics averaged over the extra steps, then ``metrics_fn``).
+    (extra-loss metrics averaged over the extra steps, then ``metrics_fn`` if the
+    state is on the learner). The method state argument is donated: the caller
+    passes a copy it no longer needs (`train_chunk`).
     """
+    on_learner = bool(_LEARNER_HOOKS & set(hk.active))
     grad = jax.value_and_grad(lambda p, mb: _seq_loss(cfg, net, p, mb), has_aux=True)
     extra_grad = jax.value_and_grad(hk.extra_loss_fn, has_aux=True)
 
@@ -296,10 +350,11 @@ def _make_learn(
         ts, ms, key = c
         key, k = jax.random.split(key)
         (_, (ms, m)), g = extra_grad(ts.params, ms, k)
-        ts = ts.apply_gradients(grads=g)  # type: ignore[no-untyped-call]  # flax API
-        return (ts, ms, key), m
+        new = ts.apply_gradients(grads=g)  # type: ignore[no-untyped-call]  # flax API
+        norm = optax.tree.norm(g)
+        return (_skip_if_zero(ts, new, norm), ms, key), (m, norm)
 
-    @jax.jit
+    @functools.partial(jax.jit, donate_argnums=3)
     def learn(
         ts: TrainState, b: Batch, traj: Traj | None, ms: Any, key: jax.Array
     ) -> Any:
@@ -310,11 +365,20 @@ def _make_learn(
         m = [x.mean() for x in aux]
         method: dict[str, jax.Array] = {}
         if "extra_loss_fn" in hk.active:
-            c, em = jax.lax.scan(extra_step, (ts, ms, key), None, hk.extra_steps)
+            before = ts.params
+            c, (em, norms) = jax.lax.scan(
+                extra_step, (ts, ms, key), None, hk.extra_steps
+            )
             ts, ms, key = c
             check_metric_names(em)
             method |= {k: v.mean() for k, v in em.items()}
-        method |= hk.metrics_fn(ms)
+            if (group := _extra_group(em)) is not None:
+                method[f"{group}/grad_norm"] = norms.mean()
+                method[f"{group}/kl_after"] = _policy_kl(net, before, ts.params, b)
+            if "after_extra_fn" in hk.active:
+                ms = hk.after_extra_fn(ms, method)
+        if on_learner:
+            method |= hk.metrics_fn(ms)
         return ts, ms, key, jnp.array([*m[:4], ev, *m[4:]]), method
 
     return learn
@@ -331,6 +395,8 @@ class _Setup:
     hooks: ResolvedHooks
     rollout: Callable[..., Any]
     learn: Callable[..., Any]
+    metrics: Callable[..., Any]
+    """Jitted ``metrics_fn`` on the actor, for a state that never leaves it."""
     learner: jax.Device
     actor: jax.Device
     mesh: Mesh | None
@@ -345,8 +411,23 @@ class _Setup:
 
     @property
     def learner_state(self) -> bool:
-        """Whether the method state moves to the learner for the update."""
+        """Whether the update reads the method state on the learner."""
         return bool(_LEARNER_HOOKS & set(self.hooks.active))
+
+    @property
+    def rollout_state(self) -> bool:
+        """Whether the rollout reads the method state (``intrinsic_reward_fn``)."""
+        return "intrinsic_reward_fn" in self.hooks.active
+
+    @property
+    def resident(self) -> bool:
+        """Whether the method state lives on the learner and never moves."""
+        return self.learner_state and not self.rollout_state
+
+    @property
+    def actor_metrics(self) -> bool:
+        """Whether ``metrics_fn`` runs on the actor (the state stays there)."""
+        return "metrics_fn" in self.hooks.active and not self.learner_state
 
 
 @functools.cache
@@ -370,6 +451,7 @@ def _setup(cfg: PPORNNConfig) -> _Setup:
         hk,
         _make_rollout(cfg, net, env, env_params, hk),
         _make_learn(cfg, net, hk),
+        jax.jit(hk.metrics_fn),
         roles.learner,
         roles.actor,
         mesh,
@@ -405,8 +487,14 @@ class PPORNNState(struct.PyTreeNode):  # type: ignore[no-untyped-call]  # flax A
     cfg: PPORNNConfig = struct.field(pytree_node=False)  # type: ignore[no-untyped-call]  # flax API
 
 
-def init_state(cfg: PPORNNConfig, key: jax.Array) -> PPORNNState:
-    """Fresh params on the learner; envs, GRU carry and method state on the actor."""
+def init_state(
+    cfg: PPORNNConfig, key: jax.Array, memory_limit_bytes: int | None = None
+) -> PPORNNState:
+    """Fresh params on the learner; envs and GRU carry on the actor.
+
+    The method state goes to the actor, or to the learner if only the update reads it.
+    ``memory_limit_bytes`` goes to the method in `HookSpec`.
+    """
     s = _setup(cfg)
     key, k_init, k_reset, k_method = jax.random.split(key, 4)
     with jax.default_device(s.learner):
@@ -416,7 +504,8 @@ def init_state(cfg: PPORNNConfig, key: jax.Array) -> PPORNNState:
         # an array from the start, as after an update (see `ppo.init_state`)
         ts = ts.replace(step=jnp.zeros((), jnp.int32))
     n_ach = len(achievement_names(cfg.env))
-    spec = HookSpec(cfg.envs, s.net.obs_dim, s.net.n_actions, n_ach, cfg.steps)
+    dims = (cfg.envs, s.net.obs_dim, s.net.n_actions, n_ach, cfg.steps)
+    spec = HookSpec(*dims, memory_limit_bytes)
     with jax.default_device(s.actor):
         obs, st = s.env.reset(k_reset, s.env_params)
         per_env = (
@@ -426,6 +515,7 @@ def init_state(cfg: PPORNNConfig, key: jax.Array) -> PPORNNState:
             jnp.zeros(cfg.envs, bool),
             init_acc(cfg.envs, n_ach),
         )
+    with jax.default_device(s.learner if s.resident else s.actor):
         method_state = s.hooks.init_state_fn(k_method, spec)
     if s.mesh is not None:
         per_env = shard_envs(per_env, s.mesh)
@@ -438,7 +528,9 @@ def init_state(cfg: PPORNNConfig, key: jax.Array) -> PPORNNState:
         last_done=last_done,
         episode=episode,
         env_steps=jax.device_put(jnp.zeros((), jnp.int32), s.shared_at),
-        method_state=_on_actor(method_state, s, cfg.envs),
+        method_state=jax.device_put(method_state, s.learner)  # already there
+        if s.resident
+        else _on_actor(method_state, s, cfg.envs),
         key=jax.device_put(key, s.learner),
         key_act=jax.device_put(jax.random.fold_in(key, 1), s.shared_at),
         cfg=cfg,
@@ -455,12 +547,14 @@ def collect(
     """
     s = _setup(state.cfg)
     params = jax.device_put(state.train_state.params, s.shared_at)
+    # a state the rollout does not read stays where it is, out of the scan carry
+    on_actor = s.rollout_state or not s.learner_state
     carry = (
         state.hidden,
         state.obs,
         state.last_done,
         state.env_state,
-        _on_actor(state.method_state, s, state.cfg.envs),
+        _on_actor(state.method_state, s, state.cfg.envs) if on_actor else None,
         state.env_steps,
         state.episode,
         state.key_act,
@@ -474,7 +568,7 @@ def collect(
         last_done=last_done,
         episode=episode,
         env_steps=t,
-        method_state=ms,
+        method_state=ms if on_actor else state.method_state,
         key_act=key_act,
     )
     return new, batch, traj, ep
@@ -489,6 +583,8 @@ def train_chunk(
     """
     s = _setup(state.cfg)
     losses, eps, method = [], [], []
+    if s.resident:  # `learn` donates it: the caller's state stays valid
+        state = state.replace(method_state=jax.tree.map(jnp.copy, state.method_state))
     for _ in range(n_updates):
         state, batch, traj, ep = collect(state, s.with_traj)
         put = functools.partial(jax.device_put, device=s.learner)
@@ -498,6 +594,8 @@ def train_chunk(
         )
         if s.learner_state:
             state = state.replace(method_state=ms)
+        elif s.actor_metrics:
+            m |= s.metrics(state.method_state)
         state = state.replace(train_state=ts, key=key)
         losses.append(loss)
         eps.append(ep)
@@ -574,7 +672,7 @@ class PPORNNTrainer:
         if cfg.anneal_lr and "steps" not in config:
             msg = "PPO-RNN with anneal_lr needs the budget: pass `steps` in the config"
             raise ValueError(msg)
-        return init_state(cfg, key)
+        return init_state(cfg, key, config.get(MEMORY_LIMIT_KEY))
 
     def train_chunk(
         self, state: PPORNNState, n_updates: int

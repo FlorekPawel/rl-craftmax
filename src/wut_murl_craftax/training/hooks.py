@@ -32,12 +32,17 @@ HOOK_NAMES = (
     "intrinsic_reward_fn",
     "observe",
     "extra_loss_fn",
+    "after_extra_fn",
     "env_wrapper_fn",
     "metrics_fn",
 )
 """The callable hooks, in call order; also the names `ResolvedHooks.active` reports."""
 OLD_METRIC_PREFIX = "hook/"
 """Prefix of the first draft of the metric names; now refused."""
+MEMORY_LIMIT_KEY = "memory_limit_bytes"
+"""Runtime key the runner adds to each run config beside ``steps``: the machine
+profile's limit. Never hashed or saved; trainer configs ignore it and pass it on as
+`HookSpec.memory_limit_bytes`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +54,9 @@ class HookSpec:
     n_actions: int
     n_achievements: int
     total_steps: int
+    memory_limit_bytes: int | None = None
+    """Memory the method's buffers may take on this machine (the profile's); None
+    outside the runner (evaluation, tests): nothing to check."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -62,7 +70,9 @@ class HookFields:
     init_state_fn: Callable[[jax.Array, HookSpec], State] | None = None
     """``(key, spec) -> state``, once in init; ``spec`` is `HookSpec` (Classic, 8 envs:
     8, 1345, 17, 22, budget). The state is one pytree in the train state, saved by
-    ``save_state`` and moved to the actor for the rollout and back."""
+    ``save_state``. It lives on the actor; with ``observe`` or ``extra_loss_fn`` it
+    moves to the learner and back each update, or stays on the learner for good when
+    ``intrinsic_reward_fn`` is unset (PPO-RNN; the rollout never reads it)."""
     intrinsic_reward_fn: (
         Callable[
             [State, Any, Any, jax.Array, jax.Array, jax.Array], tuple[jax.Array, State]
@@ -85,14 +95,22 @@ class HookFields:
     extra_steps: int = 0
     """K optimizer steps on ``extra_loss_fn`` after the PPO epochs, same Adam state; the
     learning-rate schedule is indexed by update, so K does not shift it. At 0 the extra
-    loss is not active, even when set."""
+    loss is not active, even when set. PPO-RNN skips a step whose gradient is all zero
+    (nothing to learn): params and Adam moments stay, only the step counts advance.
+    PPO-RNN adds ``<group>/grad_norm`` (mean gradient norm of the K steps) and
+    ``<group>/kl_after`` (mean KL of the policy before and after them on the PPO batch)
+    to the extra loss's metrics, ``<group>`` being the one group of its names."""
+    after_extra_fn: Callable[[State, dict[str, jax.Array]], State] | None = None
+    """``(state, metrics) -> state``, once after the extra steps with their metrics
+    (averaged, plus the two above); PPO-RNN only, active with the extra loss."""
     env_wrapper_fn: Callable[[Any, Any], tuple[Any, Any]] | None = None
     """``(env, env_params) -> (env, env_params)``, once when the training or the
     evaluation env is built. The wrapped env must proxy ``name`` and keep the Craftax
     state reachable through ``.env_state`` (`unwrap_state`): step events and episode
     metrics read it; ``ppo.make_env`` refuses a wrapper that breaks either."""
     metrics_fn: Callable[[State], dict[str, Any]] | None = None
-    """``(state) -> dict``, once per update; names are ``count/..``, ``sil/..``,
+    """``(state) -> dict``, once per update where the state is (after the learner
+    hooks, else on the actor after the rollout); names are ``count/..``, ``sil/..``,
     ``smdp/..``, ``dyna/..``, logged unchanged (`check_metric_names`; the old ``hook/``
     prefix is refused, at trace time on the first update)."""
 
@@ -132,6 +150,7 @@ class ResolvedHooks:
     observe: Callable[[State, Traj], State]
     extra_loss_fn: Callable[..., tuple[jax.Array, tuple[State, dict[str, jax.Array]]]]
     extra_steps: int
+    after_extra_fn: Callable[[State, dict[str, jax.Array]], State]
     env_wrapper_fn: Callable[[Any, Any], tuple[Any, Any]]
     metrics_fn: Callable[[State], dict[str, Any]]
     active: tuple[str, ...]
@@ -181,6 +200,10 @@ def _no_extra_loss(
     return jnp.zeros((), jnp.float32), (state, {})
 
 
+def _keep_after_extra(state: State, _metrics: dict[str, jax.Array]) -> State:
+    return state
+
+
 def _keep_env(env: Any, env_params: Any) -> tuple[Any, Any]:
     return env, env_params
 
@@ -203,7 +226,7 @@ def _checked(
 def resolve(hooks: HookFields) -> ResolvedHooks:
     """Fill the no-op defaults of ``hooks`` and report the hooks the method set.
 
-    ``extra_loss_fn`` counts as set only with ``extra_steps > 0``.
+    ``extra_loss_fn`` and ``after_extra_fn`` count as set only with ``extra_steps > 0``.
 
     Raises:
         ValueError: If ``extra_steps`` is negative, or positive with no
@@ -220,13 +243,14 @@ def resolve(hooks: HookFields) -> ResolvedHooks:
         return default if hook is None else hook  # `or` would drop a falsy callable
 
     metrics = hooks.metrics_fn
-    unused = () if hooks.extra_steps else ("extra_loss_fn",)
+    unused = () if hooks.extra_steps else ("extra_loss_fn", "after_extra_fn")
     return ResolvedHooks(
         init_state_fn=pick(hooks.init_state_fn, _no_init),
         intrinsic_reward_fn=pick(hooks.intrinsic_reward_fn, _zero_reward),
         observe=pick(hooks.observe, _keep_state),
         extra_loss_fn=pick(hooks.extra_loss_fn, _no_extra_loss),
         extra_steps=hooks.extra_steps,
+        after_extra_fn=pick(hooks.after_extra_fn, _keep_after_extra),
         env_wrapper_fn=pick(hooks.env_wrapper_fn, _keep_env),
         metrics_fn=_checked(metrics) if metrics is not None else _no_metrics,
         active=tuple(
