@@ -24,7 +24,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Self, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
 
 import flax.linen as nn
 import jax
@@ -63,6 +63,8 @@ NO_ACTION = -1
 """Last action at an episode start: its one-hot input is all zeros."""
 LR_END = 1e-20
 """Learning rate at the end of the linear decay, as the original."""
+FILLED_LOSS_COLUMNS = ("value_loss", "grad_norm")
+"""`LOSS_COLUMNS` an update fills: the TD loss and the gradient norm; others NaN."""
 _LEARNER_HOOKS = {"observe", "extra_loss_fn", "metrics_fn"}
 """Hooks that read the method state on the learner, so it moves there each update."""
 _CLI_ONLY = {"seed"}
@@ -609,12 +611,53 @@ def learn(
     ``(steps, envs)`` drops transitions from the loss. ``h0`` is the float32 start
     carry after step 0's reset (default: ``traj.hidden[0]``, rounded to float16).
     Returns the train state and the mean ``td_loss`` and ``grad_norm`` of its steps.
+
+    Raises:
+        ValueError: If the rollout, ``loss_mask`` or ``h0`` is not ``(num_steps,
+            envs)`` / ``(envs, hidden)`` of the config, or ``h0`` is missing while
+            ``traj.hidden`` is None.
     """
     s = _setup(train_state.cfg)
+    _check_rollout(train_state.cfg, traj, loss_mask, h0)
     return cast(
         tuple[QTrainState, dict[str, jax.Array]],
         s.learn(train_state, traj, key, loss_mask, h0),
     )
+
+
+def _check_rollout(
+    cfg: PQNRNNConfig, traj: Traj, loss_mask: jax.Array | None, h0: Carry | None
+) -> None:
+    """Refuse shapes `learn` would silently mishandle (its env shuffle is per config).
+
+    Raises:
+        ValueError: On any mismatch, naming the shapes.
+    """
+    want = (cfg.num_steps, cfg.envs)
+    arrays = {
+        "traj.obs": traj.obs,
+        "traj.actions": traj.actions,
+        "traj.rewards": traj.rewards,
+        "traj.dones": traj.dones,
+        'traj.extra["last_actions"]': traj.extra["last_actions"],
+    }
+    if loss_mask is not None:
+        arrays["loss_mask"] = loss_mask
+    errors = [
+        f"{name} has steps x envs {tuple(x.shape[:2])}, the config needs {want}"
+        for name, x in arrays.items()
+        if tuple(x.shape[:2]) != want
+    ]
+    if h0 is None and traj.hidden is None:
+        errors.append("h0 is required when traj.hidden is None")
+    carry = (cfg.envs, cfg.hidden)
+    errors += [
+        f"h0 leaves must be (envs, hidden) = {carry}, got {tuple(x.shape)}"
+        for x in jax.tree.leaves(h0)
+        if tuple(x.shape) != carry
+    ]
+    if errors:
+        raise ValueError("; ".join(errors))
 
 
 def _on_actor(tree: Any, s: _Setup, envs: int) -> Any:
@@ -759,7 +802,8 @@ def _update(
     """Learner side of one update: ``observe``, `learn`, extra steps, method metrics.
 
     The losses come in ``records.LOSS_COLUMNS`` order: the TD loss as
-    ``value_loss``, ``grad_norm`` (before clipping); PPO-only columns are NaN.
+    ``value_loss``, ``grad_norm`` (before clipping); the PPO-only columns are NaN,
+    and `PQNRNNTrainer.loss_columns` keeps them out of logging and abort checks.
     """
     key, k_learn, k_extra = jax.random.split(state.key, 3)
     ms = state.method_state
@@ -776,7 +820,7 @@ def _update(
     state = state.replace(
         train_state=ts, method_state=ms, key=key, updates=updates, eps=eps
     )
-    cols = {"value_loss": m["td_loss"], "grad_norm": m["grad_norm"]}
+    cols = dict(zip(FILLED_LOSS_COLUMNS, (m["td_loss"], m["grad_norm"]), strict=True))
     nan = jnp.full((), jnp.nan, jnp.float32)
     return state, jnp.stack([cols.get(c, nan) for c in LOSS_COLUMNS]), method
 
@@ -856,6 +900,8 @@ class PQNRNNTrainer:
     """
 
     cfg: PQNRNNConfig
+    loss_columns: ClassVar[tuple[str, ...]] = FILLED_LOSS_COLUMNS
+    """The runner logs and abort-checks only these (the others are NaN)."""
 
     def config(self, config: Mapping[str, Any]) -> PQNRNNConfig:
         """The factory config with the run config's keys on top."""
