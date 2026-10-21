@@ -13,6 +13,7 @@ if TYPE_CHECKING:  # real names for type checkers; runtime imports stay lazy
         save_checkpoint,
         save_state,
     )
+    from .count_bonus import CountBonusConfig, CountState
     from .hooks import (
         HOOK_NAMES,
         HookFields,
@@ -55,6 +56,7 @@ if TYPE_CHECKING:  # real names for type checkers; runtime imports stay lazy
         load_episodes,
         load_metrics,
     )
+    from .sil import SILConfig, SILState
     from .wrappers import (
         BatchEnvWrapper,
         GymnaxWrapper,
@@ -73,6 +75,8 @@ _EXPORTS: dict[str, str] = {
     "ActorCriticRNN": "ppo_rnn",
     "BatchEnvWrapper": "wrappers",
     "BatchRenorm": "batch_renorm",
+    "CountBonusConfig": "count_bonus",
+    "CountState": "count_bonus",
     "Episodes": "records",
     "GymnaxWrapper": "wrappers",
     "LogWrapper": "wrappers",
@@ -89,6 +93,8 @@ _EXPORTS: dict[str, str] = {
     "RNNQNetwork": "pqn_rnn",
     "ResolvedHooks": "hooks",
     "RunLog": "records",
+    "SILConfig": "sil",
+    "SILState": "sil",
     "TrainingMetrics": "records",
     "Traj": "hooks",
     "achievement_names": "records",
@@ -125,6 +131,8 @@ __all__ = [
     "ActorCriticRNN",
     "BatchEnvWrapper",
     "BatchRenorm",
+    "CountBonusConfig",
+    "CountState",
     "Episodes",
     "GymnaxWrapper",
     "HookFields",
@@ -144,6 +152,8 @@ __all__ = [
     "RNNQNetwork",
     "ResolvedHooks",
     "RunLog",
+    "SILConfig",
+    "SILState",
     "TrainingMetrics",
     "Traj",
     "achievement_names",
