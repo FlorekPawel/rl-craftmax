@@ -1,27 +1,33 @@
 """Tests for the resumable runner: lookup, resume, signals, run directory, workers."""
 
+import dataclasses
 import functools
 import inspect
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import mlflow
 import numpy as np
 import pytest
 import yaml
+from _fake_registry import NO_EVAL, REGISTRY
 from _fake_trainer import STEPS_PER_UPDATE, FakeTrainer
+from _toy_method import TINY, TOY
 
 from wut_murl_craftax.orchestration import queue, runner
 from wut_murl_craftax.orchestration.profiles import Profile, load_profile
-from wut_murl_craftax.orchestration.queue import RunSpec, expand_phase
+from wut_murl_craftax.orchestration.queue import RunSpec, config_hash, expand_phase
 from wut_murl_craftax.orchestration.runner import final_score, worker_specs
 from wut_murl_craftax.orchestration.tracking import artifact_path
 from wut_murl_craftax.training.checkpoints import (
@@ -30,6 +36,7 @@ from wut_murl_craftax.training.checkpoints import (
     load_params,
     load_state,
 )
+from wut_murl_craftax.training.ppo import make_env
 from wut_murl_craftax.training.records import LOSS_COLUMNS
 from wut_murl_craftax.visualisation import eval_rollouts
 
@@ -90,7 +97,7 @@ class Store:
         files = sorted(p.name for p in run_dir.iterdir())
         self.evaluated.append((spec.name, spec.phase, status, files))
 
-    def run(self, specs: list[RunSpec], trainer: FakeTrainer, **kw: Any) -> None:
+    def run(self, specs: list[RunSpec], trainer: Any, **kw: Any) -> None:
         runner.main(
             specs,
             PROFILE,
@@ -345,6 +352,49 @@ def test_a_signal_saves_the_state_and_marks_the_run_killed(
     assert {s: signal.getsignal(s) for s in handlers} == handlers
 
 
+def test_each_training_segment_records_its_code_version(
+    store: Store, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A resume under another commit is tagged and logged, never refused."""
+    versions = iter([("a" * 40, False), ("b" * 40, True)])
+    monkeypatch.setattr(runner, "code_version", lambda: next(versions))
+    (spec,) = store.phase("tune-coarse", ["published"])
+    with pytest.raises(SystemExit):
+        store.run([spec], FakeTrainer((2, signal.SIGINT)))
+    tags = store.runs()[spec.name].data.tags
+    assert (tags["code/commit"], tags["code/dirty"]) == ("a" * 40, "false")
+    assert tags["code/segments"] == "a" * 12
+    assert "code/changed" not in tags
+    store.run([spec], FakeTrainer())
+    run = store.runs()[spec.name]
+    assert run.info.status == "FINISHED"
+    tags = run.data.tags
+    assert (tags["code/commit"], tags["code/dirty"]) == ("a" * 40, "false")
+    assert tags["code/segments"] == f"{'a' * 12},{'b' * 12}+dirty"
+    assert tags["code/changed"] == "true"
+    assert f"{spec.name} resumes under commit {'b' * 12}" in caplog.text
+
+
+def test_a_resume_into_another_state_layout_fails_the_run_clearly(store: Store) -> None:
+    """New code with another state shape never restores a run's old state."""
+
+    class Wider(FakeTrainer):
+        def init(self, config: Any, key: jax.Array) -> dict[str, Any]:
+            state = super().init(config, key)
+            return {**state, "params": {"w": jnp.zeros(4)}}
+
+    (spec,) = store.phase("tune-coarse", ["published"])
+    with pytest.raises(SystemExit):
+        store.run([spec], FakeTrainer((2, signal.SIGINT)))
+    trainer = Wider()
+    with pytest.raises(RuntimeError, match=r"\['w'\].*\(3,\).*\(4,\)"):
+        store.run([spec], trainer)
+    run = store.runs()[spec.name]
+    assert run.info.status == "FAILED"
+    assert "comes from other code" in run.data.tags["fail/error"]
+    assert trainer.updates == []
+
+
 @pytest.mark.parametrize("left", ["KILLED", "RUNNING"])
 @pytest.mark.parametrize(
     ("spu", "cut_at", "saved_at"),
@@ -476,13 +526,42 @@ def test_a_trainer_error_marks_the_run_failed(store: Store) -> None:
             raise FloatingPointError
 
     (spec,) = store.phase("tune-coarse", ["published"])
-    with pytest.raises(FloatingPointError):
+    with pytest.raises(RuntimeError, match=r"1 of 1 runs failed.*FloatingPointError"):
         store.run([spec], Broken())
-    assert store.runs()[spec.name].info.status == "FAILED"
+    run = store.runs()[spec.name]
+    assert run.info.status == "FAILED"
+    assert run.data.tags["fail/error"].startswith("FloatingPointError")
+    assert run.data.tags["fail/count"] == "1"
     trainer = FakeTrainer()
     store.run([spec], trainer)
     assert trainer.updates == [1, 2, 3]
     assert store.runs()[spec.name].info.status == "FINISHED"
+
+
+def test_a_failing_run_does_not_stop_the_queue(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The error is recorded on the run and logged; the next spec still runs."""
+
+    class FailsFirst(FakeTrainer):
+        def init(self, config: Any, key: jax.Array) -> Any:
+            if not self.init_steps:
+                self.init_steps.append(None)
+                msg = "out of memory"
+                raise MemoryError(msg)
+            return super().init(config, key)
+
+    first, second = store.phase("tune-coarse", ["published", "lr-hi"])
+    trainer = FailsFirst()
+    with pytest.raises(RuntimeError, match=rf"1 of 2 runs failed: {first.name}"):
+        store.run([first, second], trainer)
+    runs = store.runs()
+    assert runs[first.name].info.status == "FAILED"
+    assert runs[first.name].data.tags["fail/error"] == "MemoryError: out of memory"
+    assert runs[second.name].info.status == "FINISHED"
+    assert trainer.updates == [1, 2, 3]
+    assert [e[0] for e in store.evaluated] == [second.name]
+    assert f"{first.name} failed" in caplog.text
 
 
 # --- runtime --------------------------------------------------------------------
@@ -585,6 +664,23 @@ def nan_at(update: int) -> Callable[[int], dict[str, float]]:
 def tags_of(store: Store, name: str, prefix: str) -> dict[str, str]:
     tags = store.runs()[name].data.tags
     return {k: v for k, v in tags.items() if k.startswith(prefix)}
+
+
+def test_abort_metrics_the_trainer_never_reports_are_tagged_once(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A typo in ``abort.finite`` or a flag metric would disable its guard silently."""
+    (spec,) = store.phase("tune-coarse", ["published"])
+    store.run([spec], FakeTrainer(extra=lambda u: {"ppo/entropy": 0.5}))
+    unreported = "ppo/approx_kl,ppo/explained_variance,ppo/value_loss"
+    tags = tags_of(store, spec.name, "warn/")
+    assert tags == {"warn/abort_unreported": unreported}
+    assert caplog.text.count("never reports") == 1
+    (other,) = store.phase("tune-coarse", ["lr-hi"])
+    every = {"ppo/entropy": 0.5, "ppo/approx_kl": 0.0}
+    every |= {"ppo/explained_variance": 1.0, "ppo/value_loss": 0.1}
+    store.run([other], FakeTrainer(extra=lambda u: every))
+    assert tags_of(store, other.name, "warn/") == {}
 
 
 def test_a_non_finite_loss_fails_the_run_and_keeps_its_last_state(store: Store) -> None:
@@ -798,21 +894,25 @@ def test_a_lost_final_checkpoint_is_rebuilt_from_the_state(store: Store) -> None
     assert [e[0] for e in store.evaluated] == [spec.name] * 2
 
 
-def test_an_earlier_lost_checkpoint_fails_a_complete_run_on_every_call(
-    store: Store,
+def test_an_earlier_lost_checkpoint_fails_a_complete_run_then_skips_it(
+    store: Store, caplog: pytest.LogCaptureFixture
 ) -> None:
     (spec,) = store.phase("tune-coarse", ["published"])
     store.run([spec], FakeTrainer())
     _ckpt(store, spec.name, 1).unlink()
     _ckpt(store, spec.name, 2).unlink()
-    for _ in range(3):  # the cleaned index must not hide the loss from later calls
-        with pytest.raises(RuntimeError, match=r"\[1, 2\] are lost"):
-            store.run([spec], FakeTrainer())
+    with pytest.raises(RuntimeError, match=r"\[1, 2\] are lost"):
+        store.run([spec], FakeTrainer())
+    for _ in range(2):  # later calls skip it with a warning, they never retrain it
+        trainer = FakeTrainer()
+        store.run([spec], trainer)
+        assert trainer.updates == []
         run = store.runs()[spec.name]
         assert run.info.status == "FAILED"
         assert run.data.tags["ckpt/missing"] == "1,2"
     assert [e["update"] for e in load_index(store.run_dir(spec.name))] == [0, 3]
     assert len(store.evaluated) == 1  # only the first call evaluated
+    assert f"{spec.name} lost checkpoints 1,2 for good, skipped" in caplog.text
 
 
 def test_a_lost_checkpoint_of_a_run_in_progress_stays_tagged_and_fails_at_the_end(
@@ -827,10 +927,283 @@ def test_a_lost_checkpoint_of_a_run_in_progress_stays_tagged_and_fails_at_the_en
         store.run([spec], FakeTrainer((20, signal.SIGINT), steps_per_update=spu))
     run = store.runs()[spec.name]
     assert (run.info.status, run.data.tags["ckpt/missing"]) == ("KILLED", "1")
-    for _ in range(2):  # it trains on, then fails; a rerun fails at once
-        trainer = FakeTrainer(steps_per_update=spu)
-        with pytest.raises(RuntimeError, match=r"\[1\] are lost"):
-            store.run([spec], trainer)
-        run = store.runs()[spec.name]
-        assert (run.info.status, run.data.tags["ckpt/missing"]) == ("FAILED", "1")
+    with pytest.raises(RuntimeError, match=r"\[1\] are lost"):  # trains on, fails
+        store.run([spec], FakeTrainer(steps_per_update=spu))
+    run = store.runs()[spec.name]
+    assert (run.info.status, run.data.tags["ckpt/missing"]) == ("FAILED", "1")
     assert _ckpt(store, spec.name, 40).is_file()
+    trainer = FakeTrainer(steps_per_update=spu)
+    store.run([spec], trainer)  # a rerun skips it
+    assert trainer.updates == []
+
+
+def test_a_methods_knobs_reach_its_hooks_in_training_and_evaluation(
+    store: Store,
+) -> None:
+    """Two grid entries of a hook method: the runner trains each entry's bonus and
+    evaluation opens each run with its own env wrapper (2 PPO-RNN updates); the hooks
+    read the method keys and the resolved base config (``gamma``)."""
+    knobs = [
+        {"toy_bonus": 0.0, "toy_features": 0, "gamma": 0.99},
+        {"toy_bonus": 0.5, "toy_features": 3, "gamma": 0.5},
+    ]
+    specs = []
+    for k in knobs:
+        cfg = {"method": "toy", **TINY, **k}
+        specs.append(
+            RunSpec("toy", "a", "0.128k", ENV, 0, cfg, config_hash(cfg), "x", "final")
+        )
+    store.run(specs, TOY)
+    plain, params = make_env(ENV)
+    width = plain.observation_space(params).shape[0]
+    for k, spec in zip(knobs, specs, strict=True):
+        out = store.run_dir(spec.name)
+        with np.load(out / runner.EXTRAS_FILE) as z:
+            per_update = 64 * k["toy_bonus"] * k["gamma"]  # 8 envs x 8 steps
+            assert z["toy/bonus_sum"].tolist() == [per_update, 2 * per_update]
+        run = eval_rollouts.EvalRun.load(out, {"toy": TOY})
+        obs, _ = run.env.reset(jax.random.key(0), run.env_params)
+        assert obs.shape == (width + k["toy_features"],)
+        assert (obs[width:] == k["gamma"]).all()  # the builder saw the base gamma
+        policy, p = run.policy, run.params(run.updates[-1])
+        act, _ = policy.step(
+            p, policy.init_carry(1), obs[None], jax.random.key(1), True
+        )
+        assert act.shape == (1,)
+
+
+# --- one child process per run ----------------------------------------------------
+
+
+def _in_children(store: Store, specs: list[RunSpec]) -> None:
+    """``runner.main`` as the queue calls it: no live trainers, a child per run."""
+    runner.main(
+        specs,
+        PROFILE,
+        experiment_config=store.config,
+        registry=REGISTRY,
+        evaluate=NO_EVAL,
+    )
+
+
+def _as(spec: RunSpec, registry: str) -> RunSpec:
+    return dataclasses.replace(spec, registry_name=registry)
+
+
+def test_each_run_trains_in_its_own_child_process(store: Store) -> None:
+    specs = store.phase("tune-coarse", ["published", "lr-hi"])
+    _in_children(store, specs)
+    runs = store.runs()
+    assert {runs[s.name].info.status for s in specs} == {"FINISHED"}
+    pids = {runs[s.name].data.tags["pid"] for s in specs}
+    assert len(pids) == 2
+    assert str(os.getpid()) not in pids
+    assert store.runtime_calls == []  # the parent never sets up JAX
+
+
+def test_a_crashed_child_fails_its_run_and_the_queue_continues(store: Store) -> None:
+    published, hi = store.phase("tune-coarse", ["published", "lr-hi"])
+    crash = _as(published, "crash")
+    with pytest.raises(RuntimeError, match=rf"1 of 2 runs failed: {crash.name}.*-9"):
+        _in_children(store, [crash, hi])
+    runs = store.runs()
+    assert runs[crash.name].info.status == "FAILED"
+    assert "exited with -9" in runs[crash.name].data.tags["fail/error"]
+    assert runs[hi.name].info.status == "FINISHED"
+
+
+def test_a_signal_to_the_parent_stops_the_child_with_its_state_saved(
+    store: Store,
+) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    stop = _as(spec, "stop")
+    with pytest.raises(SystemExit) as exit_info:
+        _in_children(store, [stop])
+    assert exit_info.value.code == 128 + signal.SIGINT
+    run = store.runs()[stop.name]
+    assert run.info.status == "KILLED"
+    saved = load_state(
+        store.run_dir(stop.name),
+        runner.state_template(FakeTrainer().init(stop.config, jax.random.key(0)), stop),
+    )
+    assert saved["update"] == 2
+    _in_children(store, [stop])  # the rerun resumes at update 3 and finishes
+    assert store.runs()[stop.name].info.status == "FINISHED"
+
+
+_QUEUE = """
+import json, sys
+from wut_murl_craftax.orchestration import runner
+from wut_murl_craftax.orchestration.queue import RunSpec
+spec = RunSpec(**json.loads(sys.argv[1]))
+runner.main([spec], sys.argv[2], experiment_config=sys.argv[3],
+            registry="_fake_registry:METHODS", evaluate="_fake_registry:no_eval")
+"""
+"""A queue process of one spec, as ``python -m ...queue`` would run it."""
+
+
+def _start_queue(
+    store: Store,
+    spec: RunSpec,
+    launcher: tuple[str, ...] = (sys.executable,),
+    *,
+    nohup: bool = False,
+) -> subprocess.Popen[str]:
+    """The queue in its own session, as a terminal's foreground job (under ``nohup``:
+    SIGHUP ignored, as the queue inherits it)."""
+    path = os.pathsep.join([str(HERE), os.environ.get("PYTHONPATH", "")])
+    argv = [json.dumps(dataclasses.asdict(spec)), str(PROFILE), str(store.config)]
+    return subprocess.Popen(
+        [*launcher, "-c", _QUEUE, *argv],
+        env={**os.environ, "PYTHONPATH": path},
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        preexec_fn=(lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        if nohup
+        else None,
+    )
+
+
+def _until(cond: Callable[[], Any], what: str, timeout: float = 120.0) -> Any:
+    deadline = time.monotonic() + timeout
+    while not (got := cond()):
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.2)
+    return got
+
+
+def _training_pid(store: Store, name: str) -> int:
+    """The PID of the child once it trains the run."""
+
+    def pid() -> int | None:
+        run = store.runs().get(name)
+        return int(run.data.tags["pid"]) if run and "pid" in run.data.tags else None
+
+    return int(_until(pid, f"{name} to start training"))
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_a_child_whose_queue_dies_saves_its_state_and_stops(store: Store) -> None:
+    """kill -9 of the queue process: the orphan stops as if signalled."""
+    (spec,) = store.phase("tune-coarse", ["published"])
+    slow = _as(spec, "slow")
+    queue_process = _start_queue(store, slow)
+    child = _training_pid(store, slow.name)
+    os.kill(queue_process.pid, signal.SIGKILL)
+    queue_process.communicate(timeout=120)
+    _until(lambda: not _alive(child), "the orphaned child to exit", 60)
+    run = store.runs()[slow.name]
+    assert run.info.status == "KILLED"
+    out = store.run_dir(slow.name)
+    assert (out / "state" / "state.npz").is_file()
+    assert not (out / runner.OWNER_FILE).exists()
+
+
+def test_a_run_with_a_live_child_is_never_trained_twice(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    slow = _as(spec, "slow")
+    queue_process = _start_queue(store, slow)
+    child = _training_pid(store, slow.name)
+    _in_children(store, [slow])  # a second queue over the same run
+    assert f"{slow.name} is trained by live process {child}" in caplog.text
+    run = store.runs()[slow.name]
+    assert (run.info.status, run.data.tags["pid"]) == ("RUNNING", str(child))
+    os.kill(queue_process.pid, signal.SIGINT)
+    queue_process.communicate(timeout=120)
+    assert queue_process.returncode == 128 + signal.SIGINT
+    assert store.runs()[slow.name].info.status == "KILLED"
+
+
+def test_a_hangup_of_the_queue_stops_the_child_like_a_signal(store: Store) -> None:
+    """SIGHUP (the terminal or SSH session closed) is a stop, not a death."""
+    (spec,) = store.phase("tune-coarse", ["published"])
+    hangup = _as(spec, "hangup")
+    with pytest.raises(SystemExit) as exit_info:
+        _in_children(store, [hangup])
+    assert exit_info.value.code == 128 + signal.SIGHUP
+    assert store.runs()[hangup.name].info.status == "KILLED"
+
+
+def test_a_signal_before_the_child_starts_spawns_none(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def signalled(found: Any) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(runner, "_skip_reason", signalled)
+    (spec,) = store.phase("tune-coarse", ["published"])
+    with pytest.raises(SystemExit) as exit_info:
+        _in_children(store, [spec])
+    assert exit_info.value.code == 128 + signal.SIGTERM
+    assert store.runs() == {}
+
+
+def test_a_crash_at_exit_after_the_run_finished_is_only_a_warning(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    crash = _as(spec, "exit-crash")
+    _in_children(store, [crash])  # no failure is raised
+    assert store.runs()[crash.name].info.status == "FINISHED"
+    assert "exited with 3 after closing its run" in caplog.text
+
+
+def test_a_repeated_signal_within_a_second_is_one_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``uv run`` forwards the terminal's SIGINT that python also got: ~0.2 s apart."""
+    now = [100.0]
+    monkeypatch.setattr(runner.time, "monotonic", lambda: now[0])
+    stop = runner._Stop()
+    stop(signal.SIGINT, None)
+    now[0] += 0.5
+    stop(signal.SIGINT, None)  # the echo: ignored
+    assert stop.signum == signal.SIGINT
+    now[0] += 1.0
+    with pytest.raises(KeyboardInterrupt):  # a deliberate second Ctrl-C
+        stop(signal.SIGINT, None)
+
+
+def test_one_ctrl_c_under_uv_run_stops_the_child_cleanly(store: Store) -> None:
+    """A terminal's Ctrl-C reaches uv and python; uv forwards it a second time."""
+    (spec,) = store.phase("tune-coarse", ["published"])
+    slow = _as(spec, "slow")
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is not installed")
+    queue_process = _start_queue(store, slow, (uv, "run", "--no-sync", "python"))
+    _training_pid(store, slow.name)
+    os.killpg(queue_process.pid, signal.SIGINT)  # the whole foreground job
+    _, stderr = queue_process.communicate(timeout=120)
+    assert queue_process.returncode == 128 + signal.SIGINT, stderr[-2000:]
+    assert "KeyboardInterrupt" not in stderr
+    assert stderr.count("signal 2: stopping") == 1
+    run = store.runs()[slow.name]
+    assert run.info.status == "KILLED"
+    assert (store.run_dir(slow.name) / "state" / "state.npz").is_file()
+
+
+def test_a_queue_under_nohup_keeps_ignoring_hangups(store: Store) -> None:
+    """``nohup make queue``: the inherited SIG_IGN for SIGHUP stays in force."""
+    (spec,) = store.phase("tune-coarse", ["published"])
+    slow = _as(spec, "slow")
+    queue_process = _start_queue(store, slow, nohup=True)
+    _training_pid(store, slow.name)
+    os.kill(queue_process.pid, signal.SIGHUP)
+    time.sleep(2.0)  # a stop would end the run within a chunk (0.5 s)
+    assert queue_process.poll() is None
+    assert store.runs()[slow.name].info.status == "RUNNING"
+    os.kill(queue_process.pid, signal.SIGINT)
+    queue_process.communicate(timeout=120)
+    assert queue_process.returncode == 128 + signal.SIGINT
+    assert store.runs()[slow.name].info.status == "KILLED"

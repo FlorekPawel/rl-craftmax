@@ -5,9 +5,10 @@ A run's directory is its MLflow artifact directory: ``config.json``, ``metrics.n
 ``eval/``. A run name is looked up across the whole store: a FINISHED run only joins
 the phase (tag ``phases``) and gets its missing evaluations; any other run resumes
 from ``state/`` (or restarts in place without it); a new name starts in the phase's
-experiment. SIGINT or SIGTERM end the current chunk, save the state and mark the run
-KILLED. Trainers come from ``training.interface.METHODS``; see `Trainer`. Evaluation:
-``visualisation.eval_rollouts.evaluate_spec``, imported after ``configure_runtime``.
+experiment. Each run trains in a fresh child process that builds its trainer from the
+registry name and config alone (`main`); the parent forwards SIGINT and SIGTERM, which
+end the chunk, save the state and mark the run KILLED. Trainers: `Trainer`, registered
+in ``training.interface.METHODS``; evaluation: ``eval_rollouts.evaluate_spec``.
 """
 
 import functools
@@ -15,15 +16,18 @@ import importlib
 import json
 import logging
 import math
+import multiprocessing
 import os
 import signal
+import socket
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import FrameType
-from typing import Any, Protocol, TypedDict, cast
+from typing import Any, Protocol, TypedDict
 
 import jax
 import mlflow
@@ -54,9 +58,11 @@ from .abort import (
     TAG_ABORT_BUG,
     TAG_ABORT_COUNT,
     TAG_ABORT_METRIC,
+    TAG_ABORT_UNREPORTED,
     TAG_ABORT_UPDATE,
     first_nonfinite,
     flag_hits,
+    unreported,
 )
 from .profiles import Profile, load_profile
 from .queue import (
@@ -70,6 +76,7 @@ from .queue import (
     TAG_SEED,
     RunSpec,
 )
+from .reproducibility import code_version
 from .runtime import (
     DeviceRoles,
     configure_runtime,
@@ -77,7 +84,7 @@ from .runtime import (
     import_craftax,
     select_platforms,
 )
-from .tracking import _resolve_tracking_uri, build_mlflow_tracker
+from .tracking import _resolve_tracking_uri, artifact_path, build_mlflow_tracker
 from .train_metrics import (
     compile_seconds,
     log_every,
@@ -95,8 +102,29 @@ MIN_FINAL_EPISODES = 100
 """Episodes the final-score window is widened backwards to."""
 TAG_CKPT_MISSING = "ckpt/missing"
 """Run tag: comma-joined updates whose checkpoint file is lost and cannot be rebuilt."""
+TAG_FAIL_ERROR = "fail/error"
+"""Run tag: the error of the last failed call (type and message, truncated)."""
+TAG_CODE_COMMIT = "code/commit"
+"""Run tag: the git commit the run started training under (``code/dirty`` beside)."""
+TAG_CODE_SEGMENTS = "code/segments"
+"""Run tag: comma-joined 12-hex commits (``+dirty``) of each training segment."""
+TAG_CODE_CHANGED = "code/changed"
+"""Run tag: ``true`` once a segment resumed under another commit than the last one."""
+TAG_FAIL_COUNT = "fail/count"
+"""Run tag: how many calls failed on the run (errors and crashes, not aborts)."""
 EXTRAS_FILE = "extras.npz"
 """Per-update method metrics of a run, name -> floats, in the run directory."""
+OWNER_FILE = "owner.json"
+"""Run-directory file of the process that trains the run (pid, host); gone once the
+run is closed, so a RUNNING run with a live owner is never trained twice."""
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+"""Signals that stop the queue after the chunk; SIGHUP: the terminal or SSH closed
+(unless the queue inherited it ignored, as under ``nohup``)."""
+ECHO_S = 1.0
+"""A repeat of the first signal within this many seconds is the same signal: ``uv run``
+forwards the terminal's Ctrl-C, which python also got (measured 0.2 s apart)."""
+REGISTRY = "wut_murl_craftax.training.interface:METHODS"
+"""``module:attribute`` of the trainer registry a run's child process imports."""
 _RUN_ID_VARIABLES = ("MLFLOW_RUN_ID", "MLFLOW_ACTIVE_RUN_ID")
 """Environment variables that make MLflow or the tracker reopen a given run."""
 
@@ -168,6 +196,14 @@ class Trainer(Protocol):
 
         Evaluation passes the abstract state of ``jax.eval_shape(init)``: read its
         structure and static fields only; acting reads values from the params alone.
+        """
+        ...
+
+    def env_wrapper(self, state: Any) -> Callable[[Any, Any], tuple[Any, Any]] | None:
+        """The method's ``env_wrapper_fn``, None without one (abstract state as above).
+
+        Evaluation applies it inside ``LogWrapper`` as training does
+        (``training.ppo.make_env``).
         """
         ...
 
@@ -272,22 +308,32 @@ def _snapshot(
 
 @dataclass
 class _Stop:
-    """Signal handler that records the first SIGINT or SIGTERM."""
+    """Signal handler that records the first stop signal (`STOP_SIGNALS`)."""
 
     signum: int | None = None
+    at: float = 0.0
+    """`time.monotonic` of the first signal."""
 
     def __call__(self, signum: int, _frame: FrameType | None) -> None:
-        """Record the signal; a second one stops at once."""
+        """Record the signal; a second one stops at once, unless it is its echo."""
         if self.signum is not None:
+            if signum == self.signum and time.monotonic() - self.at < ECHO_S:
+                return
             raise KeyboardInterrupt
-        self.signum = signum
+        self.signum, self.at = signum, time.monotonic()
         logger.warning("signal %d: stopping after the current chunk", signum)
 
 
 @contextmanager
 def _stop_on_signals() -> Iterator[_Stop]:
     stop = _Stop()
-    old = {s: signal.signal(s, stop) for s in (signal.SIGINT, signal.SIGTERM)}
+    # an inherited SIG_IGN for SIGHUP (``nohup``) stays: the queue outlives a hangup
+    kept = signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    old = {
+        s: signal.signal(s, stop)
+        for s in STOP_SIGNALS
+        if not (kept and s == signal.SIGHUP)
+    }
     try:
         yield stop
     finally:
@@ -420,13 +466,44 @@ def _check_finite(
         raise _Aborted(update + hit[0] + 1, hit[1])
 
 
-def _registry() -> Mapping[str, Trainer]:
-    """``training.interface.METHODS``, imported after ``configure_runtime``.
+def _imported(ref: str) -> Any:
+    """The object a ``module:attribute`` reference names."""
+    module, _, name = ref.partition(":")
+    return getattr(importlib.import_module(module), name)
 
-    The trainers import Craftax, which starts the JAX backends on import.
+
+def _set_up_jax(
+    machine: Profile,
+    methods: Mapping[str, Trainer] | str,
+    evaluate: Evaluate | str | None,
+) -> tuple[Mapping[str, Trainer], Evaluate]:
+    """Platforms, runtime and Craftax before any JAX use, then trainers and evaluation.
+
+    A registry reference is imported after ``configure_runtime``: the trainers import
+    Craftax, which starts the JAX backends on import.
     """
-    module = importlib.import_module("..training.interface", __package__)
-    return cast(Mapping[str, Trainer], module.METHODS)
+    select_platforms(machine.device_roles)
+    configure_runtime(host_devices=machine.host_devices)
+    import_craftax()  # before evaluation traces ``init``, which builds the env
+    trainers = _imported(methods) if isinstance(methods, str) else methods
+    if isinstance(evaluate, str):
+        return trainers, _imported(evaluate)
+    return trainers, evaluate or functools.partial(evaluate_fixed_seeds, trainers)
+
+
+def _tag_flags(hits: Mapping[str, int], flagged: set[str]) -> None:
+    """Tag each flag at the first update its rule held at, once per call."""
+    for name, at in hits.items():
+        if name not in flagged:
+            mlflow.set_tag(f"{FLAG_PREFIX}{name}", str(at))
+            flagged.add(name)
+
+
+def _tag_unreported(names: Sequence[str]) -> None:
+    """Tag and log abort metrics the trainer never reports: their guard is off."""
+    if names:
+        mlflow.set_tag(TAG_ABORT_UNREPORTED, ",".join(names))
+        logger.warning("the trainer never reports abort metrics %s", names)
 
 
 def _chunk_size(update: int, n_updates: int, ckpts: list[int], every: int) -> int:
@@ -506,11 +583,12 @@ def _train(
         chunks.append((n, wall - start))
         _add_updates(log, update, spu, np.linspace(start, wall, n + 1)[1:], metrics)
         extras.extend(update, _method_metrics(metrics))
+        if not chunks[
+            1:
+        ]:  # the first chunk of this call shows what the trainer reports
+            _tag_unreported(unreported(rules, finite, extras.series))
         update += n
-        for name, at in flag_hits(rules, extras.series, n_updates).items():
-            if name not in flagged:  # the first update the rule held at
-                mlflow.set_tag(f"{FLAG_PREFIX}{name}", str(at))
-                flagged.add(name)
+        _tag_flags(flag_hits(rules, extras.series, n_updates), flagged)
         if update in ckpts and update not in written:
             save_checkpoint(out, update, update * spu, wall, trainer.params(state))
         extras.save()
@@ -560,6 +638,67 @@ def _mark_abort(previous: Mapping[str, str], abort: _Aborted) -> None:
     logger.warning("run aborted (%d of %d allowed): %s", count, MAX_ABORTS, abort)
 
 
+def _live_owner(found: Any) -> int | None:
+    """The PID of a live process on this host that trains ``found`` (RUNNING)."""
+    if found is None or found.info.status != "RUNNING":
+        return None
+    try:
+        path = artifact_path(found.info.artifact_uri) / OWNER_FILE
+        owner = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    pid = int(owner["pid"])
+    if owner["host"] != socket.gethostname() or pid == os.getpid():
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:  # alive, another user's process
+        pass
+    return pid
+
+
+def _skip_reason(found: Any) -> str | None:
+    """Why the queue skips a run: a live owner, a bug, or lost checkpoints."""
+    if (pid := _live_owner(found)) is not None:
+        return f"is trained by live process {pid} on this host"
+    tags = found.data.tags if found else {}
+    if tags.get(TAG_ABORT_BUG) == "true":
+        return f"is marked a bug ({TAG_ABORT_BUG})"
+    if found and found.info.status == "FAILED" and tags.get(TAG_CKPT_MISSING):
+        return f"lost checkpoints {tags[TAG_CKPT_MISSING]} for good"
+    return None
+
+
+def _fail_tags(
+    previous: Mapping[str, str], error: BaseException | str
+) -> dict[str, str]:
+    """`TAG_FAIL_ERROR` and the next `TAG_FAIL_COUNT` of a failed call."""
+    text = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+    count = int(previous.get(TAG_FAIL_COUNT, 0)) + 1
+    return {TAG_FAIL_ERROR: text[:500], TAG_FAIL_COUNT: str(count)}
+
+
+def _code_tags(name: str, previous: Mapping[str, str]) -> dict[str, str]:
+    """Code version tags of a training segment; a commit change is tagged and logged.
+
+    A resume under another commit is allowed (fixes must reach running runs).
+    """
+    commit, dirty = code_version()
+    segment = commit[:12] + ("+dirty" if dirty else "")
+    segments = [s for s in previous.get(TAG_CODE_SEGMENTS, "").split(",") if s]
+    tags = {TAG_CODE_SEGMENTS: ",".join([*segments, segment])}
+    if TAG_CODE_COMMIT not in previous:
+        tags |= {TAG_CODE_COMMIT: commit, "code/dirty": str(dirty).lower()}
+    if segments and segments[-1].split("+")[0] != commit[:12]:
+        tags[TAG_CODE_CHANGED] = "true"
+        logger.warning(
+            "%s resumes under commit %s, not %s", name, commit[:12], segments[-1]
+        )
+    return tags
+
+
 def _run_spec(
     spec: RunSpec,
     trainer: Trainer,
@@ -568,10 +707,15 @@ def _run_spec(
     evaluate: Evaluate,
     stop: _Stop,
 ) -> bool:
-    """Bring one run to FINISHED, or to KILLED on a signal; return if it trained."""
+    """Bring one run to FINISHED, or to KILLED on a signal; return if it trained.
+
+    Raises:
+        Exception: Any error of the run, after it is closed FAILED with the
+            `TAG_FAIL_ERROR` and `TAG_FAIL_COUNT` tags.
+    """
     found = find_run(spec.name)
-    if found and found.data.tags.get(TAG_ABORT_BUG) == "true":
-        logger.warning("%s is marked a bug (%s), skipped", spec.name, TAG_ABORT_BUG)
+    if (reason := _skip_reason(found)) is not None:
+        logger.warning("%s %s, skipped", spec.name, reason)
         return False
     phases = found.data.tags.get(TAG_PHASES, "").split(",") if found else []
     tags = {
@@ -595,6 +739,8 @@ def _run_spec(
         msg = f"{spec.name}: MLflow opened run {active.run_name} ({active.run_id})"
         raise RuntimeError(msg)  # e.g. $MLFLOW_RUN_ID set in the environment
     out = tracker.artifact_dir
+    owner = {"pid": os.getpid(), "host": socket.gethostname()}
+    (out / OWNER_FILE).write_text(json.dumps(owner))
     # a FINISHED run with a lost checkpoint file goes through `_train` to repair it
     trains = (
         found is None
@@ -605,6 +751,7 @@ def _run_spec(
         if trains:
             roles = device_roles()
             mlflow.set_tags(run_tags(roles))  # where it trains now, not where it began
+            mlflow.set_tags(_code_tags(spec.name, found.data.tags if found else {}))
             (out / CONFIG_ARTIFACT).write_text(json.dumps(spec.config, indent=1))
             log = _train(trainer, spec, out, profile, roles, stop)
             if log is None or stop.signum is not None:
@@ -620,14 +767,171 @@ def _run_spec(
         _mark_abort(found.data.tags if found else {}, abort)
         tracker.close("FAILED")  # its last state/ stays for the one retry
         return True
-    except Exception:
+    except Exception as error:
+        mlflow.set_tags(_fail_tags(found.data.tags if found else {}, error))
         tracker.close("FAILED")
         raise
-    if stop.signum is not None:
-        tracker.close("KILLED")  # evaluation may have stopped early
+    else:
+        # evaluation may have stopped early
+        tracker.close("KILLED" if stop.signum is not None else "FINISHED")
         return trains
-    tracker.close("FINISHED")
-    return trains
+    finally:
+        (out / OWNER_FILE).unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class _Job:
+    """What a run's child process gets: picklable values only, no live objects."""
+
+    spec: RunSpec
+    experiment: ExperimentConfig
+    machine: Profile
+    registry: str
+    evaluate: str | None
+
+
+def _child(job: _Job, stop_set: Any, stop_signum: Any, trained: Any, done: Any) -> None:
+    """One run in a fresh process; the parent sets ``stop_set`` to forward a signal.
+
+    The child also stops (saves the state, closes the run KILLED) when its parent
+    dies, so an orphan never trains on beside a later queue call.
+    """
+    os.setpgrp()  # a terminal's Ctrl-C reaches the parent only, which forwards it
+    for s in STOP_SIGNALS:  # also a scheduler's, sent to every PID
+        signal.signal(s, signal.SIG_IGN)
+    parent = multiprocessing.parent_process()  # its sentinel sees a death at once
+    trainers, evaluate = _set_up_jax(job.machine, job.registry, job.evaluate)
+    if job.spec.registry_name not in trainers:
+        msg = f"no trainer registered for {job.spec.registry_name!r} in {job.registry}"
+        raise ValueError(msg)
+    mlflow.set_tracking_uri(_resolve_tracking_uri(job.experiment.mlflow.tracking_uri))
+    stop = _Stop()
+
+    def forwarded() -> None:
+        while not stop_set.wait(1.0):
+            if parent is not None and not parent.is_alive():  # the queue died
+                logger.warning("queue process %d is gone: stopping", parent.pid)
+                stop.signum = signal.SIGHUP
+                return
+        stop.signum = stop_signum.value
+
+    threading.Thread(target=forwarded, daemon=True).start()
+    trainer = trainers[job.spec.registry_name]
+    trained.value = _run_spec(
+        job.spec, trainer, job.experiment, job.machine, evaluate, stop
+    )
+    done.value = True  # the run is closed: a crash from here on is only a warning
+
+
+def _close_orphan(name: str, status: str, error: str) -> str:
+    """Close a run its dead child left RUNNING; return the run's error text."""
+    found = find_run(name)
+    if found is None or found.info.status != "RUNNING":
+        return str(found.data.tags.get(TAG_FAIL_ERROR, error)) if found else error
+    client = mlflow.MlflowClient()
+    if status == "FAILED":
+        for key, value in _fail_tags(found.data.tags, error).items():
+            client.set_tag(found.info.run_id, key, value)
+    client.set_terminated(found.info.run_id, status)
+    (artifact_path(found.info.artifact_uri) / OWNER_FILE).unlink(missing_ok=True)
+    return error
+
+
+def _in_child(job: _Job, stop: _Stop) -> bool:
+    """`_run_spec` in a spawned child; return if it trained.
+
+    A signal to this process is forwarded once; a second one kills the child.
+
+    Raises:
+        RuntimeError: The child exited non-zero without a signal (its error, or a
+            crash such as an OOM kill: the run is then closed FAILED here).
+    """
+    ctx = multiprocessing.get_context("spawn")
+    stop_set, signum = ctx.Event(), ctx.Value("i", 0)
+    trained, done = ctx.Value("b", False), ctx.Value("b", False)
+    args = (job, stop_set, signum, trained, done)
+    child = ctx.Process(target=_child, args=args, name=job.spec.name)
+    try:
+        child.start()
+        while child.exitcode is None:
+            child.join(0.1)
+            if stop.signum is not None and not stop_set.is_set():
+                signum.value = stop.signum
+                stop_set.set()
+    except KeyboardInterrupt:  # a second signal: stop at once
+        if child.is_alive():  # false while `start` had not returned
+            child.kill()
+            child.join()
+        _close_orphan(job.spec.name, "KILLED", "killed by a second signal")
+        raise
+    if child.exitcode and done.value:
+        logger.warning(
+            "%s: child exited with %d after closing its run",
+            job.spec.name,
+            child.exitcode,
+        )
+    elif child.exitcode:
+        crashed = f"child process exited with {child.exitcode}"
+        if stop.signum is not None:
+            _close_orphan(job.spec.name, "KILLED", crashed)
+        else:
+            msg = f"{_close_orphan(job.spec.name, 'FAILED', crashed)} ({crashed})"
+            raise RuntimeError(msg)
+    return bool(trained.value)
+
+
+type RunOne = Callable[[RunSpec, _Stop], bool]
+"""Brings one spec's run to FINISHED (or KILLED on a stop); returns if it trained."""
+
+
+def _runs_here(
+    machine: Profile,
+    experiment: ExperimentConfig,
+    methods: Mapping[str, Trainer],
+    evaluate: Evaluate | str | None,
+    specs: Sequence[RunSpec],
+) -> RunOne:
+    """Runs in this process with live trainers (tests).
+
+    Raises:
+        ValueError: If a spec's registry name has no trainer.
+    """
+    trainers, evaluate_here = _set_up_jax(machine, methods, evaluate)
+    if missing := sorted({s.registry_name for s in specs} - set(trainers)):
+        msg = f"no trainer registered for {missing}"
+        raise ValueError(msg)
+
+    def run(spec: RunSpec, stop: _Stop) -> bool:
+        trainer = trainers[spec.registry_name]
+        return _run_spec(spec, trainer, experiment, machine, evaluate_here, stop)
+
+    return run
+
+
+def _runs_in_children(
+    machine: Profile,
+    experiment: ExperimentConfig,
+    registry: str,
+    evaluate: Evaluate | str | None,
+) -> RunOne:
+    """Runs in one spawned child each; skipped runs start no child.
+
+    Raises:
+        TypeError: If ``evaluate`` is a callable, which a child cannot import.
+    """
+    if evaluate is not None and not isinstance(evaluate, str):
+        msg = "a child process imports `evaluate`: pass a module:attribute reference"
+        raise TypeError(msg)
+
+    def run(spec: RunSpec, stop: _Stop) -> bool:
+        if (reason := _skip_reason(find_run(spec.name))) is not None:
+            logger.warning("%s %s, skipped", spec.name, reason)
+            return False
+        if stop.signum is not None:  # stopped before the child: start none
+            return False
+        return _in_child(_Job(spec, experiment, machine, registry, evaluate), stop)
+
+    return run
 
 
 def main(
@@ -640,34 +944,31 @@ def main(
     experiment_config: Path = EXPERIMENT_CONFIG,
     tracking_uri: str | None = None,
     methods: Mapping[str, Trainer] | None = None,
-    evaluate: Evaluate | None = None,
+    evaluate: Evaluate | str | None = None,
+    registry: str = REGISTRY,
 ) -> None:
     """Train, evaluate and log this worker's specs, at most ``max_runs`` trained ones.
 
-    ``select_platforms``, ``configure_runtime`` and ``import_craftax`` run first,
-    before any JAX computation (the profile decides the backends and the CPU split)
-    or trace; runs reused as FINISHED do not count towards ``max_runs``. MLflow
-    settings come from ``experiment_config``, the experiment name replaced by each
-    spec's phase and the tracking URI by ``tracking_uri`` when given (a cluster
-    node's own store).
-    ``evaluate`` defaults to `evaluate_fixed_seeds` with this worker's trainers.
+    Each run trains in a fresh spawned child that imports ``registry`` (a
+    ``module:attribute`` reference) and ``evaluate`` (a reference, or None for
+    `evaluate_fixed_seeds`). Live ``methods`` (tests) run in this process instead,
+    with ``evaluate`` a callable. ``select_platforms``, ``configure_runtime`` and
+    ``import_craftax`` run first wherever runs train, before any JAX computation or
+    trace. Runs reused as FINISHED do not count towards ``max_runs``. MLflow settings
+    come from ``experiment_config``, the experiment name replaced by each spec's
+    phase and the tracking URI by ``tracking_uri`` when given (a node's own store).
+
+    A run that fails is closed FAILED with its error tagged (`TAG_FAIL_ERROR`) and
+    logged, and the next spec runs; runs marked a bug, or failed for lost
+    checkpoints, are skipped with a warning.
 
     Raises:
         SystemExit: 128 + the signal number after SIGINT or SIGTERM.
+        RuntimeError: At the end, naming every run of this call that failed.
     """
     machine = load_profile(profile)
-    select_platforms(machine.device_roles)
-    configure_runtime(host_devices=machine.host_devices)
-    import_craftax()  # before evaluation traces ``init``, which builds the env
     mine = worker_specs(specs, worker_index, num_workers)
-    trainers = _registry() if methods is None else methods
-    missing = sorted({s.registry_name for s in mine} - set(trainers))
-    if missing:
-        msg = f"no trainer registered for {missing}"
-        raise ValueError(msg)
-    if evaluate is None:
-        evaluate = functools.partial(evaluate_fixed_seeds, trainers)
-    for variable in _RUN_ID_VARIABLES:
+    for variable in _RUN_ID_VARIABLES:  # before a child inherits the environment
         if os.environ.pop(variable, None):
             logger.warning("ignoring %s: the runner picks runs by name", variable)
     experiment = load_experiment_config(experiment_config)
@@ -676,12 +977,23 @@ def main(
             experiment, mlflow=replace(experiment.mlflow, tracking_uri=tracking_uri)
         )
     mlflow.set_tracking_uri(_resolve_tracking_uri(experiment.mlflow.tracking_uri))
-    trained = 0
+    run_one = (
+        _runs_in_children(machine, experiment, registry, evaluate)
+        if methods is None
+        else _runs_here(machine, experiment, methods, evaluate, mine)
+    )
+    trained, failed = 0, []
     with _stop_on_signals() as stop:
         for spec in mine:
             if max_runs is not None and trained >= max_runs:
                 break
-            trainer = trainers[spec.registry_name]
-            trained += _run_spec(spec, trainer, experiment, machine, evaluate, stop)
+            try:
+                trained += run_one(spec, stop)
+            except Exception as error:  # one run must not stop the queue
+                logger.exception("%s failed, next run", spec.name)
+                failed.append(f"{spec.name}: {type(error).__name__}: {error}")
             if stop.signum is not None:
                 raise SystemExit(128 + stop.signum)
+    if failed:
+        msg = f"{len(failed)} of {len(mine)} runs failed: " + "; ".join(failed)
+        raise RuntimeError(msg)

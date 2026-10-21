@@ -1,20 +1,21 @@
 """Shared extension points of the recurrent controls: the hooks later methods set.
 
-`HookFields` is the base of ``PPORNNConfig`` and ``PQNRNNConfig``; a method sets hooks
-in its factory. `None` hooks are skipped at trace time (`ResolvedHooks.active`), so with
-none the trainer graph is the control's. Hooks close over the method's config and the
-network (``build_network``); `config_dict` keeps them out of YAML and the run-name hash.
+`HookFields` is the base of ``PPORNNConfig`` and ``PQNRNNConfig``. A method is a
+`HookMethod`: its config class (its own YAML keys) and a builder of its hooks from it
+and the resolved base config, for each run config (`with_method`). `None` hooks are
+skipped at trace time (`ResolvedHooks.active`): with none, the graph is the control's.
 Env states give ``achievements`` and inventory; step outcomes come from ``traj.events``
 (`StepEvents` of the pre-reset next state; on a done ``next_env_state`` already starts
 the next episode). ``r_int`` is added before GAE, extrinsic rewards stay for the score.
-``env_wrapper_fn`` wraps the no-auto-reset env inside the log and optimistic-reset
-wrappers, so a reward or ``done`` change acts before the reset. No Craftax import here.
+``env_wrapper_fn`` wraps the bare env inside the log wrapper in training and evaluation
+(``ppo.make_env``), so it acts before resets. No Craftax import here.
 """
 
 import dataclasses
+import functools
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -86,7 +87,10 @@ class HookFields:
     learning-rate schedule is indexed by update, so K does not shift it. At 0 the extra
     loss is not active, even when set."""
     env_wrapper_fn: Callable[[Any, Any], tuple[Any, Any]] | None = None
-    """``(env, env_params) -> (env, env_params)``, once when the env is built."""
+    """``(env, env_params) -> (env, env_params)``, once when the training or the
+    evaluation env is built. The wrapped env must proxy ``name`` and keep the Craftax
+    state reachable through ``.env_state`` (`unwrap_state`): step events and episode
+    metrics read it; ``ppo.make_env`` refuses a wrapper that breaks either."""
     metrics_fn: Callable[[State], dict[str, Any]] | None = None
     """``(state) -> dict``, once per update; names are ``count/..``, ``sil/..``,
     ``smdp/..``, ``dyna/..``, logged unchanged (`check_metric_names`; the old ``hook/``
@@ -229,6 +233,102 @@ def resolve(hooks: HookFields) -> ResolvedHooks:
             n for n in HOOK_NAMES if getattr(hooks, n) is not None and n not in unused
         ),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class HookMethod[C]:
+    """A method made of hooks on a base trainer, configured by its own run-config keys.
+
+    ``config`` is a frozen dataclass whose fields are the method's YAML keys (YAML
+    lists arrive as tuples). ``hooks(method_cfg, base_cfg)`` builds its `HookFields`
+    from one such config and the resolved base trainer config (e.g. SIL's network
+    and ``gamma``). It must be pure Python and create no arrays: it may run inside
+    ``jax.eval_shape`` (evaluation), so arrays belong in ``init_state_fn``.
+    """
+
+    config: type[C]
+    hooks: Callable[[C, Any], HookFields]
+
+    @property
+    def keys(self) -> frozenset[str]:
+        """The method's run-config keys: the fields of ``config``."""
+        return frozenset(f.name for f in dataclasses.fields(cast(Any, self.config)))
+
+
+def _hashable(key: str, value: Any) -> Any:
+    """A YAML value as a hashable one: lists become tuples, mappings are refused."""
+    if isinstance(value, list | tuple):
+        return tuple(_hashable(key, v) for v in value)
+    if isinstance(value, Mapping):
+        msg = f"method key {key!r} holds a mapping; method keys take scalars or lists"
+        raise TypeError(msg)
+    return value
+
+
+def _closed_over(fn: Any) -> list[Any]:
+    """Values a hook closes over: its closure cells and partial arguments."""
+    if isinstance(fn, functools.partial):
+        return [*fn.args, *fn.keywords.values(), *_closed_over(fn.func)]
+    return [c.cell_contents for c in getattr(fn, "__closure__", None) or ()]
+
+
+@functools.cache
+def _built(method: HookMethod[Any], cfg: Any, base: Any) -> HookFields:
+    """One `HookFields` per method and base config, so equal run configs compile once.
+
+    Equal run configs give equal trainer configs: the per-config setup caches hit.
+
+    Raises:
+        ValueError: If a hook closes over an array (a tracer under ``eval_shape``).
+    """
+    hooks = method.hooks(cfg, base)
+    for name in HOOK_NAMES:
+        if any(isinstance(v, jax.Array) for v in _closed_over(getattr(hooks, name))):
+            msg = f"{name} closes over an array; create arrays in init_state_fn"
+            raise ValueError(msg)
+    return hooks
+
+
+def with_method[T: HookFields](
+    cfg: T,
+    method: HookMethod[Any] | None,
+    config: Mapping[str, Any],
+    from_config: Callable[[Mapping[str, Any], T], T],
+) -> T:
+    """The trainer config of a run config: base keys onto ``cfg``, then method hooks.
+
+    ``from_config`` applies the base keys; ``method`` builds the hooks from its own
+    keys and that base config.
+
+    The method's hooks (and ``extra_steps``) replace the base's; ``from_config``
+    refuses unknown keys, with the method's keys added to its error. Without a method
+    every key goes to ``from_config``.
+    """
+    if method is None:
+        return from_config(config, cfg)
+    mine = {k: _hashable(k, v) for k, v in config.items() if k in method.keys}
+    try:
+        base = from_config({k: v for k, v in config.items() if k not in mine}, cfg)
+    except ValueError as error:
+        error.add_note(f"method keys: {sorted(method.keys)}")
+        raise
+    hooks = _built(method, method.config(**mine), base)
+    names = (f.name for f in dataclasses.fields(HookFields))
+    return dataclasses.replace(base, **{n: getattr(hooks, n) for n in names})
+
+
+def check_method_keys(method: HookMethod[Any] | None, base: type[Any]) -> None:
+    """Refuse method keys that are also ``base`` config fields or ``method``.
+
+    Raises:
+        ValueError: Naming the shadowed keys.
+    """
+    if method is None:
+        return
+    taken = {f.name for f in dataclasses.fields(base)} | {"method"}
+    if clash := sorted(method.keys & taken):
+        msg = f"method keys {clash} are also {base.__name__} keys"
+        raise ValueError(msg)
 
 
 def config_dict(cfg: HookFields) -> dict[str, Any]:

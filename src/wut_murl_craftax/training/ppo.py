@@ -59,7 +59,12 @@ from ..orchestration import (
 from .checkpoints import checkpoint_schedule, save_checkpoint
 from .hooks import HOOK_NAMES
 from .records import LOSS_COLUMNS, RunLog, achievement_names
-from .wrappers import BatchEnvWrapper, LogWrapper, OptimisticResetVecEnvWrapper
+from .wrappers import (
+    BatchEnvWrapper,
+    LogWrapper,
+    OptimisticResetVecEnvWrapper,
+    unwrap_state,
+)
 
 if TYPE_CHECKING:  # the runner imports mlflow; the standalone CLI does not need it
     from ..orchestration.runner import ChunkMetrics
@@ -196,20 +201,56 @@ class TrainEnvConfig(Protocol):
         ...
 
 
+def _check_wrapped(bare: Any, env: Any, params: Any) -> None:
+    """Refuse a wrapped env without ``name`` or that hides the Craftax state."""
+    key = jax.random.key(0)
+    want = jax.eval_shape(bare.reset, key, bare.default_params)[1]
+    got = unwrap_state(jax.eval_shape(env.reset, key, params)[1])
+    if type(got) is not type(want):
+        msg = (
+            f"env_wrapper_fn hides the Craftax state: unwrap_state gives "
+            f"{type(got).__name__}; keep the inner state as `.env_state`"
+        )
+        raise ValueError(msg)
+    if getattr(env, "name", None) != bare.name:
+        msg = f"env_wrapper_fn must proxy the env name {bare.name!r}"
+        raise ValueError(msg)
+
+
+def make_env(
+    name: str,
+    wrap: Callable[[Any, Any], tuple[Any, Any]] | None = None,
+    *,
+    auto_reset: bool = False,
+) -> tuple[Any, Any]:
+    """The Craftax env with a method's ``env_wrapper_fn`` inside `LogWrapper`.
+
+    Training (`make_train_env`) and evaluation build their envs here, so both apply
+    the same wrapper chain.
+
+    Raises:
+        ValueError: If the wrapped env does not proxy ``name`` or `unwrap_state`
+            cannot reach the Craftax state of its states.
+    """
+    env = make_craftax_env_from_name(name, auto_reset=auto_reset)
+    params = env.default_params
+    if wrap is not None:
+        bare = env
+        env, params = wrap(env, params)
+        _check_wrapped(bare, env, params)
+    return LogWrapper(env), params
+
+
 def make_train_env(
     cfg: TrainEnvConfig, wrap: Callable[[Any, Any], tuple[Any, Any]] | None = None
 ) -> tuple[Any, Any]:
     """Batched training env and its params, built as Craftax_Baselines ``ppo.py``.
 
     ``wrap`` (a method's ``env_wrapper_fn``) wraps the bare env, inside the logging
-    and reset wrappers.
+    and reset wrappers (`make_env`).
     """
     optimistic = cfg.resets == "optimistic"
-    env = make_craftax_env_from_name(cfg.env, auto_reset=not optimistic)
-    params = env.default_params
-    if wrap is not None:
-        env, params = wrap(env, params)
-    env = LogWrapper(env)
+    env, params = make_env(cfg.env, wrap, auto_reset=not optimistic)
     if optimistic:
         ratio = min(cfg.reset_ratio, cfg.envs)
         return OptimisticResetVecEnvWrapper(env, cfg.envs, ratio), params
@@ -248,7 +289,13 @@ def gae(
 def _make_rollout(
     cfg: PPOConfig, net: ActorCritic, env: Any, env_params: Any
 ) -> Callable[..., Any]:
-    """Jitted rollout of ``num_steps`` x ``envs`` with GAE; returns the flat batch."""
+    """Jitted rollout of ``num_steps`` x ``envs`` with GAE; returns the batch.
+
+    The batch stays ``(steps, envs, ...)``, split over the env mesh like the states:
+    flattening it here makes XLA hold the whole batch on every CPU device (8 copies
+    of the 2.2 GB obs at 1024 x 64 Symbolic), so `train_chunk` flattens it on the
+    learner.
+    """
 
     def step(c: tuple[Any, ...], _: None) -> tuple[tuple[Any, ...], dict[str, Any]]:
         params, st, obs, acc, key = c
@@ -276,16 +323,10 @@ def _make_rollout(
         _, st, obs, acc, key = carry
         _, last_v = policy_value(net, params, obs)
         adv = gae(tr["r"], tr["v"], tr["d"], last_v, cfg.gamma, cfg.gae_lambda)
-        flat = {
-            k: tr[k].reshape(cfg.batch, *tr[k].shape[2:])
-            for k in ("obs", "act", "logp", "v")
-        }
-        flat |= {
-            "adv": adv.reshape(cfg.batch),
-            "tgt": (adv + tr["v"]).reshape(cfg.batch),
-        }
+        batch = {k: tr[k] for k in ("obs", "act", "logp", "v")}
+        batch |= {"adv": adv, "tgt": adv + tr["v"]}
         ep = {k: tr[k] for k in ("d", "ach", "ret", "len")}
-        return st, obs, acc, key, flat, ep
+        return st, obs, acc, key, batch, ep
 
     return rollout
 
@@ -509,6 +550,12 @@ def init_state(cfg: PPOConfig, key: jax.Array) -> PPOState:
     )
 
 
+def _flatten(batch: Batch, learner: jax.Device) -> Batch:
+    """The ``(steps, envs, ...)`` batch on ``learner`` as the step-major flat one."""
+    put = jax.device_put(batch, learner)
+    return {k: x.reshape(-1, *x.shape[2:]) for k, x in put.items()}
+
+
 def ppo_metrics(losses: jax.Array, advs: jax.Array) -> dict[str, jax.Array]:
     """The ``ppo/*`` metrics of stacked updates: loss summaries, advantage stats, lr."""
     named = {_PPO_NAMES.get(c, c): losses[:, i] for i, c in enumerate(LOSS_COLUMNS)}
@@ -527,8 +574,8 @@ def train_chunk(state: PPOState, n_updates: int) -> tuple[PPOState, "ChunkMetric
     losses, advs, eps = [], [], []
     for _ in range(n_updates):
         params_act = jax.device_put(ts.params, s.shared_at)
-        *carry, flat, ep = s.rollout(params_act, *carry)
-        ts, key, loss, adv = s.learn(ts, jax.device_put(flat, s.learner), key)
+        *carry, batch, ep = s.rollout(params_act, *carry)
+        ts, key, loss, adv = s.learn(ts, _flatten(batch, s.learner), key)
         losses.append(loss)
         advs.append(adv)
         eps.append(ep)
@@ -605,6 +652,9 @@ class PPOTrainer:
     def policy(self, state: PPOState) -> PPOPolicy:
         """The acting policy of this config's network."""
         return PPOPolicy(_setup(state.cfg).net)
+
+    def env_wrapper(self, state: PPOState) -> None:  # protocol
+        """No env wrapper: PPO has no hooks."""
 
 
 def train(cfg: PPOConfig, out: Path) -> Path:

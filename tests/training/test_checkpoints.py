@@ -12,6 +12,7 @@ import pytest
 from wut_murl_craftax.training import checkpoints
 from wut_murl_craftax.training.checkpoints import (
     checkpoint_schedule,
+    drop_missing_checkpoints,
     load_index,
     load_params,
     load_state,
@@ -131,6 +132,56 @@ def test_load_state_refuses_another_structure(tmp_path: Path) -> None:
     save_state(tmp_path, {"a": jnp.ones(2)})
     with pytest.raises(ValueError, match="template has 2"):
         load_state(tmp_path, {"a": jnp.ones(2), "b": jnp.ones(2)})
+
+
+@pytest.mark.parametrize(
+    ("like", "error"),
+    [
+        ({"a": jnp.ones(3), "b": jnp.zeros(2, jnp.int32)}, r"\['a'\].*\(2,\).*\(3,\)"),
+        ({"a": jnp.ones(2), "b": jnp.zeros(2)}, r"\['b'\].*int32.*float32"),
+        ({"a": jnp.ones(2), "c": jnp.zeros(2, jnp.int32)}, "other tree"),
+        ({"a": np.ones((0, 4)), "b": jnp.zeros(2, jnp.int32)}, r"\['a'\].*\(2,\)"),
+    ],
+)
+def test_load_state_refuses_other_shapes_dtypes_and_fields(
+    tmp_path: Path, like: dict[str, Any], error: str
+) -> None:
+    """Same leaf count, but the code that saved it had another state layout."""
+    save_state(tmp_path, {"a": jnp.ones(2), "b": jnp.zeros(2, jnp.int32)})
+    with pytest.raises(ValueError, match=error):
+        load_state(tmp_path, like)
+
+
+def test_a_state_saved_without_the_tree_paths_still_loads(tmp_path: Path) -> None:
+    """Runs saved before the paths were stored resume; leaves are still checked."""
+    state = _state()
+    save_state(tmp_path, state)
+    path = tmp_path / "state" / "state.npz"
+    with np.load(path) as z:
+        old = {k: z[k] for k in z.files if k != "paths"}
+    np.savez(path, **old)
+    _assert_identical(load_state(tmp_path, _zeros_like(state)), state)
+
+
+def test_a_checkpoint_killed_half_way_leaves_the_previous_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Params and index are renamed into place: a kill never leaves half a file."""
+    params = {"w": jnp.ones(3)}
+    save_checkpoint(tmp_path, 0, 0, 0.0, params)
+    before = (tmp_path / "ckpt" / "index.json").read_bytes()
+
+    def killed(*_: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(checkpoints.os, "replace", killed)
+    with pytest.raises(KeyboardInterrupt):
+        save_checkpoint(tmp_path, 1, 10, 1.0, params)
+    assert not (tmp_path / "ckpt" / "00001.msgpack").exists()
+    (tmp_path / "ckpt" / "00000.msgpack").unlink()
+    with pytest.raises(KeyboardInterrupt):  # cleaning the index is atomic too
+        drop_missing_checkpoints(tmp_path)
+    assert (tmp_path / "ckpt" / "index.json").read_bytes() == before
 
 
 def test_params_checkpoints_and_state_live_apart(tmp_path: Path) -> None:

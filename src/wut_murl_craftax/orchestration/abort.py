@@ -9,12 +9,13 @@ it from then on. Flags
 they never stop a run, and nothing here looks at the score (no early stopping).
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
 
 from ..training.records import LOSS_COLUMNS
+from .queue import TAG_ABORT_BUG as TAG_ABORT_BUG  # queue reads it without this module
 
 TAG_ABORT_COUNT = "abort/count"
 """Run tag: how often the run was aborted on a non-finite loss."""
@@ -22,8 +23,8 @@ TAG_ABORT_METRIC = "abort/metric"
 """Run tag: the metric that was non-finite at the last abort."""
 TAG_ABORT_UPDATE = "abort/update"
 """Run tag: the update (1-based) whose loss was non-finite at the last abort."""
-TAG_ABORT_BUG = "abort/bug"
-"""Run tag: ``true`` after a second abort; the queue skips such a run."""
+TAG_ABORT_UNREPORTED = "warn/abort_unreported"
+"""Run tag: comma-joined ``abort.finite`` and flag metrics the trainer never reports."""
 FLAG_PREFIX = "flag/"
 """Prefix of the flag tags; the value is the update at which the rule first held."""
 MAX_ABORTS = 2
@@ -51,6 +52,13 @@ def first_nonfinite(
         if (bad := ~np.isfinite(values)).any()
     ]
     return min(hits, key=lambda h: h[0]) if hits else None
+
+
+def unreported(
+    rules: Sequence[Mapping[str, Any]], finite: Sequence[str], reported: Iterable[str]
+) -> list[str]:
+    """The ``finite`` and flag-rule metrics missing from the ``reported`` names."""
+    return sorted({*finite, *(r["metric"] for r in rules)} - set(reported))
 
 
 def _first_run(cond: np.ndarray, length: int) -> int | None:
