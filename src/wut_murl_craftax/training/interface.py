@@ -14,11 +14,13 @@ import jax
 
 from ..orchestration.runner import Trainer
 from . import count_bonus, sil
+from .dyna_q import DynaTrainer
 from .ppo import PPOTrainer
 from .ppo_rnn import PPORNNConfig
 from .ppo_rnn import make_trainer as make_ppo_rnn_trainer
 from .pqn_rnn import PQNRNNConfig
 from .pqn_rnn import make_trainer as make_pqn_rnn_trainer
+from .smdp import SMDPTrainer
 
 
 class Policy(Protocol):
@@ -29,12 +31,21 @@ class Policy(Protocol):
         ...
 
     def step(
-        self, params: Any, carry: Any, obs: jax.Array, key: jax.Array, greedy: bool
+        self,
+        params: Any,
+        carry: Any,
+        obs: jax.Array,
+        key: jax.Array,
+        greedy: bool,
+        reward: jax.Array | None = None,
+        done: jax.Array | None = None,
     ) -> tuple[jax.Array, Any]:
         """Actions for a batch of observations and the next carry.
 
         ``greedy`` takes the most likely action instead of sampling; jit-safe as a
-        static argument or a traced bool.
+        static argument or a traced bool. ``reward`` and ``done`` belong to the env
+        step that produced ``obs`` (zeros at an episode start); evaluation passes
+        them, policies that do not need them ignore them.
         """
         ...
 
@@ -50,6 +61,8 @@ METHODS: Mapping[str, Trainer] = {
         PQNRNNConfig(), method=count_bonus.METHOD
     ),
     "sil": make_ppo_rnn_trainer(PPORNNConfig(), method=sil.METHOD),
+    "smdp-skills": SMDPTrainer(),
+    "dyna-q": DynaTrainer(),
 }
 """Registry name (`RunSpec.registry_name`, ``config["method"]``) -> trainer; each
 method plan adds its entry."""

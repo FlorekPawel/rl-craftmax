@@ -336,3 +336,73 @@ def test_more_than_m_envs_on_one_pair_keep_the_last_m_whole() -> None:
 def test_pack_mask_refuses_more_than_31_skills() -> None:
     with pytest.raises(ValueError, match="31"):
         pack_mask(jnp.ones(32, bool))
+
+
+# --- planning statistics (the dyna/* metrics) ---
+
+
+def test_plan_reports_backups_td_and_the_bonus() -> None:
+    """One pair 16 units old, R 0, terminal, kappa 0.01: target 0.04 from Q 0."""
+    m = write(init_model(4, 2, 8, 4), one(2, 1, done=True), jnp.array([True]), 4.0)
+    q, stats = plan_(init_table(4, 2, 0.0), m, 1, "uniform", 0.01, 20.0,
+                     jax.random.key(0), alpha=1.0)  # fmt: skip
+    assert float(q[2, 1]) == pytest.approx(0.04)
+    assert (int(stats["backups"]), int(stats["td_n"])) == (1, 1)
+    assert float(stats["td_abs"]) == pytest.approx(0.04)
+    assert float(stats["bonus"]) == pytest.approx(0.04)
+    assert float(stats["q_upd"]) == pytest.approx(0.04)
+    assert not bool(stats["q_bad"])
+    assert (int(stats["sweeps"]), int(stats["above_theta"])) == (0, 0)
+    assert float(stats["residual"]) == 0.0
+
+
+def test_prioritized_stats_count_the_pairs_above_theta_before_planning() -> None:
+    q, m = chain(5, 1.0)  # only k3 is off its target (0.95 against 0)
+    _, stats = plan_(q, m, 4, "prioritized", 0.0, 5.0, jax.random.key(0), alpha=1.0,
+                     batch=1)  # fmt: skip
+    assert int(stats["above_theta"]) == 1
+    assert int(stats["td_n"]) == 4
+    want = 0.95 + 0.9025 + 0.857375 + 0.81450625  # each backup from 0 to its value
+    assert float(stats["td_abs"]) == pytest.approx(want, rel=1e-6)
+    assert float(stats["q_upd"]) == pytest.approx(0.95)
+
+
+def test_value_iteration_stats_keep_the_last_change() -> None:
+    q, m = chain(5, 1.0)
+    _, stats = plan_(q, m, 0, "value_iteration", 0.0, 5.0, jax.random.key(0),
+                     alpha=1.0)  # fmt: skip
+    sweeps = int(stats["sweeps"])
+    assert float(stats["residual"]) < 1e-3
+    assert int(stats["td_n"]) == 5 * sweeps  # one stored outcome per pair and sweep
+    assert int(stats["backups"]) == 5 * sweeps
+    assert float(stats["q_upd"]) == pytest.approx(1.0)
+
+
+def test_a_non_finite_planned_value_is_reported() -> None:
+    m = write(init_model(4, 2, 8, 4), one(1, 0, k_next=3), jnp.array([True]), 0.0)
+    q = init_table(4, 2, 0.0).at[3].set(jnp.nan)
+    _, stats = plan_(q, m, 1, "uniform", 0.0, 0.0, jax.random.key(0), alpha=1.0)
+    assert bool(stats["q_bad"])
+    assert float(stats["q_upd"]) == -np.inf
+
+
+def test_full_backup_equals_sample_backups_of_every_filled_slot() -> None:
+    """The sort-free full backup against the duplicate-mean rule of `smdp_update`."""
+    rng = np.random.default_rng(0)
+    m = init_model(4, S, 16, 4)
+    for _ in range(30):
+        k, o = rng.integers(0, 6, 5).tolist(), rng.integers(0, S, 5).tolist()
+        k_next, done = rng.integers(0, 6, 5).tolist(), (rng.random(5) < 0.2).tolist()
+        rec = outcome(k, o, rng.random(5).tolist(), k_next, done)
+        m = write(m, rec, jnp.asarray(rng.random(5) < 0.7), jnp.float32(0.0))
+    q = jnp.asarray(rng.random((16, S)), jnp.float32)
+    p = jnp.arange(16)
+    valid = (p < m.n_pairs) & (p % 3 != 0)
+    got = full_backup(q, m, p, valid, 0.01, 5.0, 0.3)
+    slots = jnp.arange(4)
+    mask = (valid[:, None] & (slots < jnp.minimum(m.count, 4)[:, None])).ravel()
+    want = sample_backup(q, m, jnp.repeat(p, 4), jnp.tile(slots, 16), mask, 0.01, 5.0,
+                         0.3)  # fmt: skip
+    assert int(m.n_pairs) > 8
+    np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)
+    assert not np.array_equal(got, q)

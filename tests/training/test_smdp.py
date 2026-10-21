@@ -39,6 +39,7 @@ from wut_murl_craftax.training.smdp import (
     MCRecords,
     RolloutCarry,
     SMDPConfig,
+    SMDPPolicy,
     accumulate,
     init_rollout,
     init_table,
@@ -441,3 +442,57 @@ def test_the_transition_fits_pqn_rnn_learn(rig: Rig) -> None:
     ts2, m = learn(ts, traj, jax.random.key(5), mask, rig.net.init_carry(ENVS))
     assert np.isfinite(float(m["td_loss"]))
     assert int(ts2.step) == NET_CFG.epochs * NET_CFG.minibatches
+
+
+def test_an_episode_end_is_not_judged_by_the_events(rig: Rig) -> None:
+    """The done step forces success off, so `test_agreement` skips it (``fight`` is
+    judged at every other end); the step's events stay out of the outputs."""
+    c = rig.carry()
+    st = c.per_env.env_state
+    inner = st.env_state.replace(
+        timestep=st.env_state.timestep.at[0].set(rig.params.max_timesteps - 1)
+    )
+    c = force(c.replace(per_env=c.per_env.replace(
+        env_state=st.replace(env_state=inner))), [FIGHT] * 2)  # fmt: skip
+    c2, out = rig.run(c, 1)
+    assert bool(out["episode_done"][0, 0])
+    assert REASONS[int(out["reason"][0, 1])] == "running"
+    np.testing.assert_array_equal(c2.shared.agreement[FIGHT], [0, 0])
+    assert int(c2.shared.ends[FIGHT].sum()) == 1
+    assert {"unlocked", "events"}.isdisjoint(out)
+
+
+def test_a_network_without_the_skill_inputs_is_refused(rig: Rig) -> None:
+    narrow = build_network(NET_CFG, 43, 8268 - EXTRA_DIM)
+    with pytest.raises(ValueError, match="extra_obs_dim=26"):
+        init_rollout(
+            TOY, rig.env, narrow, None, jax.random.key(0), env_params=rig.params
+        )
+
+
+@pytest.mark.parametrize("flags", [True, False])
+def test_the_low_stat_interruption_follows_the_flags(rig: Rig, flags: bool) -> None:
+    """Food falls to 3 on the next step: a running skill ends there with the flags,
+    and runs on in the no-flags ablation, in the rollout and in the policy."""
+    cfg = SMDPConfig(gamma_top=GAMMA, alpha=ALPHA, log2_rows=10, low_flags=flags)
+    c = rig.carry(cfg)
+    st = c.per_env.env_state
+    hungry = st.env_state.replace(
+        player_food=jnp.full(ENVS, 4, jnp.int32), player_hunger=jnp.full(ENVS, 25.0)
+    )
+    c = force(c.replace(per_env=c.per_env.replace(
+        env_state=st.replace(env_state=hungry))), [DESCEND] * 2)  # fmt: skip
+    obs0 = c.per_env.obs
+    c2, out = rig.run(c, 1)
+    reason = "low_stat" if flags else "running"
+    assert [REASONS[int(x)] for x in out["reason"][0]] == [reason] * ENVS
+    policy = SMDPPolicy(rig.net, cfg)
+    pc = policy.init_carry(ENVS)
+    act = out["action"][0]
+    pc = (pc[0], act, jnp.full(ENVS, DESCEND), jnp.zeros(ENVS, jnp.int32), obs0,
+          jnp.ones(ENVS, bool))  # fmt: skip
+    rows = {"rows": np.zeros(0, np.int32), "q_rows": np.zeros((0, NUM_SKILLS))}
+    params = rows | {"variables": rig.variables, "eps": 0.0, "eps_top": 0.0}
+    r, d = out["native_reward"][0], out["episode_done"][0]
+    _, pc2 = policy.step(params, pc, c2.per_env.obs, jax.random.key(0), True, r, d)
+    np.testing.assert_array_equal(pc2[3], 0 if flags else 1)  # steps in the skill
