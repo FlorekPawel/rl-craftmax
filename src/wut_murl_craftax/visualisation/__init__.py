@@ -11,7 +11,14 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # real names for type checkers; runtime imports stay lazy
     from .cuts import gif, long_cut, short_cut
-    from .eval_rollouts import EvalRun, evaluate, load_eval
+    from .eval_rollouts import (
+        EvalRun,
+        evaluate,
+        evaluate_spec,
+        load_eval,
+        network_outputs,
+        replay_episode,
+    )
     from .overlay import render_overlay
     from .render import render_kept, render_master
     from .review import build_assets, write_page
@@ -35,15 +42,18 @@ _EXPORTS: dict[str, str] = {
     "Rollout": "rollout",
     "build_assets": "review",
     "evaluate": "eval_rollouts",
+    "evaluate_spec": "eval_rollouts",
     "game_for": "rollout",
     "gif": "cuts",
     "load_eval": "eval_rollouts",
     "long_cut": "cuts",
+    "network_outputs": "eval_rollouts",
     "play": "rollout",
     "render_kept": "render",
     "render_master": "render",
     "render_overlay": "overlay",
     "replay": "rollout",
+    "replay_episode": "eval_rollouts",
     "short_cut": "cuts",
     "write_page": "review",
 }
@@ -59,15 +69,18 @@ __all__ = [
     "Rollout",
     "build_assets",
     "evaluate",
+    "evaluate_spec",
     "game_for",
     "gif",
     "load_eval",
     "long_cut",
+    "network_outputs",
     "play",
     "render_kept",
     "render_master",
     "render_overlay",
     "replay",
+    "replay_episode",
     "short_cut",
     "write_page",
 ]
