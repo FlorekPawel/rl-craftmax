@@ -19,7 +19,12 @@ import pytest
 import yaml
 from _contract import assert_done_step_unlock_counted
 
-from wut_murl_craftax.orchestration.abort import TAG_ABORT_METRIC, TAG_ABORT_UPDATE
+from wut_murl_craftax.orchestration.abort import (
+    TAG_ABORT_GUARD,
+    TAG_ABORT_METRIC,
+    TAG_ABORT_UPDATE,
+    flag_hits,
+)
 from wut_murl_craftax.orchestration.queue import (
     _knob_values,
     expand_phase,
@@ -300,6 +305,8 @@ def test_one_update_logs_every_method_metric(entry: Any) -> None:
     n = int(model.n_pairs)
     assert (np.diff(pairs) >= 0).all()
     assert pairs[-1] == n > 0
+    # planning backs up only pairs with real outcomes: the table's tried pairs
+    np.testing.assert_array_equal(m["smdp/pairs_tried"], pairs)
     count, slots = model.count[:n], model.m_R.shape[1]
     assert m["dyna/pairs_full_share"][-1] == pytest.approx((count >= slots).mean())
     stale = 1000.0 - model.last_tried[:n] > 100  # time at the end: the whole budget
@@ -383,12 +390,14 @@ def test_the_model_graph_lists_every_visited_pair(entry: Any, tmp_path: Path) ->
 # --- through the runner ---------------------------------------------------------------
 
 
-def _phase(tmp_path: Path, methods_dir: Path, **over: Any) -> list[Any]:
+def _phase(
+    tmp_path: Path, methods_dir: Path, budget: str = "0.128k", **over: Any
+) -> list[Any]:
     """The specs of a 2-update Classic phase training the base on small tables."""
     phase = tmp_path / "dyna.yaml"
     item = {"ref": "base", "set": SMALL | MODEL | over}
     entry = {"config": NAME, "configs": [item], "seeds": 1}
-    raw = {"budget": "0.128k", "eval": "final", "env": CLASSIC, "runs": {NAME: entry}}
+    raw = {"budget": budget, "eval": "final", "env": CLASSIC, "runs": {NAME: entry}}
     phase.write_text(yaml.safe_dump(raw))
     return expand_phase(phase, methods_dir=methods_dir)
 
@@ -421,10 +430,32 @@ def test_the_abort_list_holds_only_the_guards_and_flags_slow_planning() -> None:
     """The guards are 0 until broken (`test_one_update_logs_every_method_metric`)."""
     assert load_method(NAME).abort == {
         "finite": SMDP_GUARDS + DYNA_GUARDS,
+        "permanent": SMDP_GUARDS[1:] + DYNA_GUARDS[1:],
         "flags": [
-            {"name": "plan_slow", "metric": "dyna/plan_wall_share", "above": 0.3}
+            {
+                "name": "plan_slow",
+                "metric": "dyna/plan_wall_share",
+                "above": 0.3,
+                "updates": 3,
+            }
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("shares", "hit"),
+    [
+        ([0.9, 0.1, 0.1, 0.1], None),  # the planner's first-call compile
+        ([0.9, 0.9, 0.1, 0.1], None),  # and a second-update recompile
+        ([0.1, 0.9, 0.9, 0.9], 4),
+    ],
+)
+def test_slow_planning_needs_three_updates_in_a_row(
+    shares: list[float], hit: int | None
+) -> None:
+    rules = load_method(NAME).abort["flags"]  # type: ignore[index]
+    hits = flag_hits(rules, {"dyna/plan_wall_share": shares}, 100)
+    assert hits.get("plan_slow") == hit
 
 
 @pytest.mark.parametrize(
@@ -466,7 +497,8 @@ def _smdp_record(q_upd: float) -> dict[str, np.ndarray]:
         "ends": z((1, n, 7), int), "agreement": z((1, n, 2), int),
         "chosen": z((1, n), int), "length": z((1, n), int),
         "td_abs": [0.0], "td_n": [0], "q_upd": [q_upd], "q_bad": [False],
-        "q_mean": [0.0], "episodes": [0], "visited": [1], "q_start": [10.0],
+        "q_mean": [0.0], "episodes": [0], "visited": [1], "tried": [1],
+        "q_start": [10.0],
         "td_loss": [0.0], "grad_norm": [0.0], "finite": [True], "found": [[0, -1, -1]],
         "eps_top": [0.5], "eps": [0.5],
     }  # fmt: skip
@@ -528,12 +560,11 @@ def test_every_configured_kappa_keeps_healthy_runs_below_the_bound() -> None:
             assert loop < dyna_q.max_q(kappa, gamma), (kappa, h)
 
 
-def _aborted(run: Any) -> tuple[str, str, str]:
-    return (
-        run.info.status,
-        run.data.tags[TAG_ABORT_METRIC],
-        run.data.tags[TAG_ABORT_UPDATE],
-    )
+def _aborted(run: Any) -> tuple[str, str, str, str | None]:
+    """Status, metric, update and the permanent guard (None: retried once)."""
+    tags = run.data.tags
+    guard = tags.get(TAG_ABORT_GUARD)
+    return run.info.status, tags[TAG_ABORT_METRIC], tags[TAG_ABORT_UPDATE], guard
 
 
 def test_a_nan_after_planning_aborts_the_run(
@@ -549,7 +580,7 @@ def test_a_nan_after_planning_aborts_the_run(
         run = run_store.run([spec])[spec.name]
     finally:
         dyna_q._planner.cache_clear()
-    assert _aborted(run) == ("FAILED", "dyna/nan", "1")
+    assert _aborted(run) == ("FAILED", "dyna/nan", "1", None)
 
 
 def test_a_full_model_aborts_the_run(
@@ -557,7 +588,7 @@ def test_a_full_model_aborts_the_run(
 ) -> None:
     (spec,) = _phase(tmp_path, methods_dir, model_pairs=2)
     run = run_store.run([spec])[spec.name]
-    assert _aborted(run) == ("FAILED", "dyna/model_full", "1")
+    assert _aborted(run) == ("FAILED", "dyna/model_full", "1", "dyna/model_full")
 
 
 def test_a_planned_value_above_the_return_bound_aborts_the_run(
@@ -575,7 +606,7 @@ def test_a_planned_value_above_the_return_bound_aborts_the_run(
         run = run_store.run([spec])[spec.name]
     finally:
         dyna_q._planner.cache_clear()
-    assert _aborted(run) == ("FAILED", "dyna/divergence", "1")
+    assert _aborted(run) == ("FAILED", "dyna/divergence", "1", "dyna/divergence")
 
 
 def test_table_values_between_300_and_the_bound_do_not_abort(
@@ -597,8 +628,8 @@ def test_slow_planning_is_flagged_without_stopping_the_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A planning step of over a second; ``entry`` compiled this config, so no
-    compile time dilutes the share."""
+    """A planning step of over a second in 5 updates: the last 3 are slow even
+    if compiles dilute the share of the first 2."""
     real = dyna_q._run_plan
 
     def slow(planner: Any, *args: Any) -> Any:
@@ -609,7 +640,7 @@ def test_slow_planning_is_flagged_without_stopping_the_run(
         return real(sleepy, *args)
 
     monkeypatch.setattr(dyna_q, "_run_plan", slow)
-    (spec,) = _phase(tmp_path, methods_dir)
+    (spec,) = _phase(tmp_path, methods_dir, budget="0.32k")
     run = run_store.run([spec])[spec.name]
     assert run.info.status == "FINISHED"
     assert "flag/plan_slow" in run.data.tags
