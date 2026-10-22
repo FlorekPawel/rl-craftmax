@@ -152,6 +152,20 @@ class Traj:
             object.__setattr__(self, "hidden", h.astype(jnp.float16))
 
 
+class SplitState(struct.PyTreeNode):  # type: ignore[no-untyped-call]  # flax API
+    """A method state in two parts, for a trainer that places them apart (PPO-RNN).
+
+    A config class with ``splits_method_state = True`` places one: ``actor`` as a
+    state with an ``intrinsic_reward_fn`` (on the actor for the rollout, on the
+    learner for the update), ``learner`` on the learner for good. The reward hook gets
+    and returns ``actor`` alone, every other hook the whole state; a learner hook
+    (``observe`` or the extra loss) must be set. `interface.combine` builds one.
+    """
+
+    actor: Any
+    learner: Any
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedHooks:
     """Hooks with no-op defaults filled in, plus which ones the method really set."""
@@ -311,7 +325,7 @@ def _closed_over(fn: Any) -> list[Any]:
 
 
 @functools.cache
-def _built(method: HookMethod[Any], cfg: Any, base: Any) -> HookFields:
+def build_hooks(method: HookMethod[Any], cfg: Any, base: Any) -> HookFields:
     """One `HookFields` per method and base config, so equal run configs compile once.
 
     Equal run configs give equal trainer configs: the per-config setup caches hit.
@@ -350,7 +364,7 @@ def with_method[T: HookFields](
     except ValueError as error:
         error.add_note(f"method keys: {sorted(method.keys)}")
         raise
-    hooks = _built(method, method.config(**mine), base)
+    hooks = build_hooks(method, method.config(**mine), base)
     names = (f.name for f in dataclasses.fields(HookFields))
     return dataclasses.replace(base, **{n: getattr(hooks, n) for n in names})
 

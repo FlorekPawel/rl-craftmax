@@ -1,16 +1,26 @@
 """Tests for the machine profiles, the platform choice and the make targets."""
 
+import ast
+import importlib
+import importlib.util
+import inspect
+import math
 import os
 import platform
+import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
+import jax.numpy as jnp
 import pytest
 import yaml
 
-from wut_murl_craftax.orchestration import runner
+from wut_murl_craftax.orchestration import runner, runtime
 from wut_murl_craftax.orchestration.profiles import Profile, load_profile
 
 REPO = Path(__file__).resolve().parents[2]
@@ -64,8 +74,35 @@ def test_cuda_profile_runs_everything_on_one_device() -> None:
     assert cuda.checkpoint_every > 0
 
 
+def test_only_the_cuda_profile_has_an_unmeasured_recompute_bound() -> None:
+    """ctrl-metrics review: measured on CPU and Metal, not yet on CUDA (TF32);
+    ``scripts/cluster/check_recompute.py`` measures it, then cuda.yaml drops it."""
+    cuda = load_profile(PROFILES / "cuda.yaml")
+    assert cuda.unmeasured_limits == ("ppo/ratio_first_mb",)
+    assert load_profile(PROFILES / "laptop.yaml").unmeasured_limits == ()
+
+
+def test_the_cuda_group_gives_mlflow_gpu_metrics_on_linux_only() -> None:
+    """MLflow's GPU monitor imports ``pynvml`` (nvidia-ml-py), else logs no GPU."""
+    from mlflow.system_metrics.metrics import gpu_monitor
+
+    assert "import pynvml" in inspect.getsource(gpu_monitor)
+    pyproject = tomllib.loads((REPO / "pyproject.toml").read_text())
+    linux = "sys_platform == 'linux'"
+    wanted = [r for r in pyproject["dependency-groups"]["cuda"] if "nvidia-ml-py" in r]
+    assert len(wanted) == 1
+    assert linux in wanted[0]
+    lock = tomllib.loads((REPO / "uv.lock").read_text())
+    (project,) = (p for p in lock["package"] if p["name"] == "wut-murl-craftax")
+    pin = {"name": "nvidia-ml-py", "marker": linux}
+    assert pin in project["dev-dependencies"]["cuda"]
+    if sys.platform != "linux":  # the laptop never gets it
+        assert importlib.util.find_spec("pynvml") is None
+
+
 def test_profiles_hold_runtime_settings_only() -> None:
     keys = {"host_devices", "device_roles", "memory_limit_bytes", "checkpoint_every"}
+    keys.add("unmeasured_limits")
     for path in PROFILES.glob("*.yaml"):
         assert yaml.safe_load(path.read_text()).keys() == keys, path.name
 
@@ -90,6 +127,7 @@ GOOD = {
     "device_roles": "cpu-actor",
     "memory_limit_bytes": GIB,
     "checkpoint_every": 10,
+    "unmeasured_limits": [],
 }
 
 
@@ -120,6 +158,8 @@ def test_an_unknown_key_fails_loudly(tmp_path: Path) -> None:
         ("checkpoint_every", 0, "checkpoint_every"),
         ("checkpoint_every", 2.5, "checkpoint_every"),
         ("host_devices", True, "host_devices"),
+        ("unmeasured_limits", "ppo/ratio_first_mb", "unmeasured_limits"),
+        ("unmeasured_limits", [1], "unmeasured_limits"),
     ],
 )
 def test_an_invalid_value_fails_loudly(
@@ -181,6 +221,28 @@ else:
     if out == "skip":
         pytest.skip("metaljax is not installed")
     assert out == "metal cpu 8"
+
+
+@pytest.mark.parametrize(
+    ("mode", "platforms", "fails"),
+    [
+        ("gpu", ["cpu"], True),
+        ("gpu", ["METAL", "cpu"], True),
+        ("gpu", ["gpu", "cpu"], False),
+        ("cpu-actor", ["cpu"], False),
+    ],
+)
+def test_the_gpu_mode_fails_loudly_without_a_gpu_backend(
+    monkeypatch: pytest.MonkeyPatch, mode: str, platforms: list[str], fails: bool
+) -> None:
+    """Review M11: a node whose CUDA plugin failed would train on one CPU device."""
+    devices = [SimpleNamespace(platform=p) for p in platforms]
+    monkeypatch.setattr(runtime.jax, "devices", lambda *_: devices)
+    if fails:
+        with pytest.raises(runtime.BackendError, match="no GPU backend"):
+            runtime.check_backend(mode)  # type: ignore[arg-type]
+    else:
+        runtime.check_backend(mode)  # type: ignore[arg-type]
 
 
 def test_the_runner_picks_the_platform_before_it_splits_the_cpu(
@@ -283,3 +345,137 @@ def test_make_merge_mlflow_needs_a_source() -> None:
     )
     assert result.returncode != 0
     assert "SRC" in result.stderr
+
+
+# --- cluster array script -------------------------------------------------------
+
+ARRAY = REPO / "scripts" / "cluster" / "run_array.sh"
+_ARRAY_ENV = ("SLURM_ARRAY_", "ARRAY_", "SEED_FROM", "STORE_DIR", "PROFILE")
+
+
+def _array(tmp_path: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+    """Run the array script with a fake ``uv`` that prints its arguments."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "uv").write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    (bin_dir / "uv").chmod(0o755)
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(_ARRAY_ENV)}
+    clean["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
+    return subprocess.run(
+        ["bash", str(ARRAY), *args],
+        cwd=tmp_path,
+        env=clean | env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_run_array_gives_each_task_a_worker_and_its_own_store(tmp_path: Path) -> None:
+    """infra-6 review M8."""
+    out = _array(
+        tmp_path,
+        "final-1b",
+        "--method",
+        "ppo",
+        SLURM_ARRAY_TASK_ID="2",
+        SLURM_ARRAY_TASK_COUNT="4",
+        SEED_FROM="/main/mlruns.db",
+    )
+    assert out.returncode == 0, out.stderr
+    store = (tmp_path / "node-stores").resolve() / "mlruns-node-2.db"
+    assert out.stdout.splitlines() == [
+        *shlex.split(QUEUE)[1:],
+        "--phase",
+        "configs/phases/final-1b.yaml",
+        "--profile",
+        "configs/profiles/cuda.yaml",
+        "--worker-index",
+        "2",
+        "--num-workers",
+        "4",
+        "--tracking-uri",
+        f"sqlite:///{store}",
+        "--seed-from",
+        "/main/mlruns.db",
+        "--method",
+        "ppo",
+    ]
+
+
+def test_run_array_takes_generic_variables_and_needs_an_index(tmp_path: Path) -> None:
+    out = _array(
+        tmp_path,
+        "smoke",
+        ARRAY_INDEX="0",
+        ARRAY_SIZE="1",
+        PROFILE="laptop",
+        STORE_DIR=str(tmp_path / "s"),
+    )
+    assert out.returncode == 0, out.stderr
+    args = out.stdout.splitlines()
+    assert args[args.index("--profile") + 1] == "configs/profiles/laptop.yaml"
+    assert args[args.index("--tracking-uri") + 1].endswith("/s/mlruns-node-0.db")
+    assert "--seed-from" not in args
+    missing = _array(tmp_path, "smoke")
+    assert missing.returncode != 0
+    assert "no array index" in missing.stderr
+
+
+def test_run_array_asks_for_sigterm_well_before_the_time_limit() -> None:
+    """Review M12: the queue gets time to end its chunk and save ``state/``."""
+    grace = re.search(
+        r"^#SBATCH --signal=B:TERM@(\d+)$", ARRAY.read_text(), re.MULTILINE
+    )
+    assert grace is not None
+    assert int(grace[1]) >= 300
+
+
+def _script(name: str) -> Any:
+    """A module of ``scripts/cluster`` (not a package), loaded from its file."""
+    spec = importlib.util.spec_from_file_location(name, ARRAY.parent / f"{name}.py")
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_check_recompute_reports_the_largest_gaps_and_the_first_ratio() -> None:
+    """ctrl-metrics review: the cluster check's arithmetic, without Craftax."""
+    check = _script("check_recompute")
+    gap = jnp.array([[[1e-6], [-2e-6]], [[3e-6], [0.0]]])  # (minibatch, step, env)
+    err = jnp.array([[[0.0], [1e-6]], [[-4e-6], [2e-6]]])
+    mbs = {
+        "obs": jnp.zeros((2, 2, 1, 2)),  # the toy network's logits: log-probs log 0.5
+        "act": jnp.zeros((2, 2, 1), jnp.int32),
+        "logp": jnp.log(0.5) - gap,
+        "v": 0.5 + err,
+        "h0": jnp.zeros((2, 1, 3)),
+        "reset": jnp.zeros((2, 2, 1), bool),
+    }
+
+    def apply(p: Any, h0: Any, obs: Any, resets: Any) -> Any:
+        return h0, obs, jnp.full(obs.shape[:-1], p)
+
+    logp, v, ratio = check.recompute_gaps(apply, 0.5, mbs)
+    assert logp == pytest.approx(3e-6, abs=1e-7)
+    assert v == pytest.approx(4e-6, abs=1e-7)
+    assert ratio == pytest.approx((math.exp(1e-6) + math.exp(-2e-6)) / 2, abs=1e-7)
+
+
+def test_check_recompute_imports_resolve_and_its_help_runs() -> None:
+    """Its imports run only on a node, so a renamed one would fail there first."""
+    path = ARRAY.parent / "check_recompute.py"
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("wut_"):
+            module = importlib.import_module(str(node.module))
+            missing = [a.name for a in node.names if not hasattr(module, a.name)]
+            assert missing == [], node.module
+    out = subprocess.run(
+        [sys.executable, str(path), "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--precision" in out.stdout

@@ -335,6 +335,33 @@ def test_method_yaml_fails_loudly(tmp_path: Path, edit: dict[str, Any]) -> None:
         load_method("bad", tmp_path)
 
 
+@pytest.mark.parametrize(
+    "combine",
+    [
+        "ppo-rnn",
+        {"base": "ppo-rnn"},
+        {"base": "ppo-rnn", "methods": ["sil"]},
+        {"base": "ppo-rnn", "methods": ["sil", "sil"]},
+        {"base": "ppo-rnn", "methods": ["a", 1]},
+        {"base": "ppo-rnn", "methods": ["a", "b"], "x": 1},
+        {"base": "pqn-rnn", "methods": ["a", "b"]},  # base_from is ppo-rnn.tuned
+    ],
+)
+def test_a_bad_combine_block_fails_loudly(tmp_path: Path, combine: object) -> None:
+    body = {"base": {"base_from": "ppo-rnn.tuned"}, "combine": combine}
+    (tmp_path / "bad.yaml").write_text(yaml.safe_dump(body))
+    with pytest.raises(ValueError, match=r"bad\.yaml combine"):
+        load_method("bad", tmp_path)
+
+
+def test_combine_names_the_pair_and_their_base(tmp_path: Path) -> None:
+    combine = {"base": "ppo-rnn", "methods": ["count-bonus-ppo-rnn", "sil"]}
+    body = {"base": {"base_from": "ppo-rnn.tuned", "beta": 0.1}, "combine": combine}
+    (tmp_path / "pair.yaml").write_text(yaml.safe_dump(body))
+    assert load_method("pair", tmp_path).combine == combine
+    assert load_method("toy", METHODS).combine is None
+
+
 @pytest.mark.parametrize("permanent", ["m", ["n"], [1]])
 def test_permanent_guards_are_a_list_of_finite_metrics(
     tmp_path: Path, permanent: object
@@ -984,6 +1011,8 @@ def test_without_dry_run_the_specs_go_to_the_runner_with_the_flags(
         "4",
         "--tracking-uri",
         "sqlite:///node.db",
+        "--seed-from",
+        "main.db",
     ])
     (specs, *flags), (_, *given) = calls
     assert [s.name for s in specs] == [
@@ -994,9 +1023,74 @@ def test_without_dry_run_the_specs_go_to_the_runner_with_the_flags(
         0,
         1,
         None,
-        {"tracking_uri": None},
+        {"tracking_uri": None, "seed_from": None},
     ]
-    assert given == [Path("p.yaml"), 1, 4, 3, {"tracking_uri": "sqlite:///node.db"}]
+    main_uri = f"sqlite:///{Path('main.db').resolve()}"  # a plain path, made a URI
+    node = {"tracking_uri": "sqlite:///node.db", "seed_from": main_uri}
+    assert given == [Path("p.yaml"), 1, 4, 3, node]
+
+
+def test_cli_seed_from_needs_a_node_store() -> None:
+    out = run_cli("--phase", "configs/phases/smoke.yaml", "--seed-from", "main.db")
+    assert out.returncode != 0
+    assert "--seed-from needs --tracking-uri" in out.stderr
+
+
+@pytest.mark.parametrize(
+    ("flags", "want"),
+    [
+        ([], None),
+        (["--tracking-uri", "sqlite:///node.db"], "sqlite:///node.db"),
+        (["--tracking-uri", "n.db", "--seed-from", "sqlite:///m.db"], "sqlite:///m.db"),
+    ],
+)
+def test_cli_expand_fine_reads_the_coarse_results_of_the_given_store(
+    monkeypatch: pytest.MonkeyPatch, flags: list[str], want: str | None
+) -> None:
+    """Review M7: a node's tune-fine ranks the coarse runs of the main store."""
+    seen: list[str | None] = []
+
+    def results(slug: str, **kw: Any) -> dict[str, float]:
+        seen.append(kw["tracking_uri"])
+        return stage1(slug, STAGE1)
+
+    monkeypatch.setattr(queue, "coarse_results", results)
+    argv = ["--methods-dir", str(METHODS), "--expand-fine", "toy", "--dry-run"]
+    queue.main([*argv, *flags])
+    assert seen == [want]
+
+
+def test_cli_expand_fine_reads_a_seed_store_given_as_a_plain_path(
+    store: Store,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review p2b I2: ``--seed-from <copy>/mlruns.db`` as run_array.sh passes it."""
+    phases = tmp_path / "phases"
+    phases.mkdir()
+    configs = [{"ref": name, "seeds": 1} for name in STAGE1]
+    body = {"budget": "1m", "eval": "final", "runs": {"toy": {"configs": configs}}}
+    (phases / "tune-coarse.yaml").write_text(yaml.safe_dump(body))
+    monkeypatch.setattr(queue, "PHASES_DIR", phases)
+    for name, score in STAGE1.items():
+        store.add("toy", resolved("toy", name), score)
+    plain = store.tracking_uri.removeprefix("sqlite:///")
+    queue.main([
+        *("--methods-dir", str(METHODS), "--expand-fine", "toy", "--dry-run"),
+        *("--tracking-uri", str(tmp_path / "node.db"), "--seed-from", plain),
+    ])
+    configs_out = [ln for ln in capsys.readouterr().out.splitlines() if ln[0] == "#"]
+    assert len(configs_out) == 4
+    assert not (tmp_path / "node.db").exists()  # a dry run opens no node store
+
+
+def test_cli_mark_tuned_takes_the_tracking_uri(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review M7."""
+    seen: list[Any] = []
+    monkeypatch.setattr(queue, "mark_tuned", lambda *a, **kw: seen.append(kw) or "")
+    queue.main(["--mark-tuned", "ppo", "abcd1234", "--tracking-uri", "sqlite:///n.db"])
+    assert seen[0]["tracking_uri"] == "sqlite:///n.db"
 
 
 def test_cli_selects_by_registry_name_and_by_slug() -> None:

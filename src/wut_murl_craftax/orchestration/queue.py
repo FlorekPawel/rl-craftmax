@@ -8,7 +8,7 @@ same config share a run. ``configs/methods/<slug>.yaml`` holds ``base``, ``budge
 resolves shallowly: donor, base, tuned or grid entry, budget, overrides
 (``resolve_config``). ``configs/phases/<phase>.yaml`` picks configs and seeds
 (``expand_phase``). CLI: ``--phase P [--method M] [--dry-run] [--expand-fine SLUG]``
-plus the runner's flags (``--profile``, ``--max-runs``, workers, ``--tracking-uri``).
+plus the runner's flags (``--profile``, ``--max-runs``, workers, node stores).
 """
 
 import argparse
@@ -58,6 +58,8 @@ TAG_ABORT_BUG = "abort/bug"
 TAG_EVAL_PENDING = "eval/pending"
 """Run tag: ``true`` while a reused FINISHED run's evaluation is incomplete (the runner
 keeps it FINISHED through a cut evaluation); results readers count it not complete."""
+TAG_FAIL_ERROR = "fail/error"
+"""Run tag: the error of the last failed call (type and message, truncated)."""
 TAG_BEST = "best"
 """Run tag set by `mark_tuned`: ``true`` on the tuned config's tuning runs."""
 CONFIG_ARTIFACT = "config.json"
@@ -68,7 +70,7 @@ TUNING_PHASES = (COARSE_PHASE, "tune-fine")
 
 EvalMode = Literal["final", "log_spaced"]
 _EVAL_MODES = ("final", "log_spaced")
-_METHOD_KEYS = {"base", "budgets", "grid", "abort", "tuned"}
+_METHOD_KEYS = {"base", "budgets", "grid", "abort", "tuned", "combine"}
 _RESERVED_NAMES = {"base", "tuned", "coarse", "fine"}
 _KNOB_KEYS = {"key", "mul", "add", "top", "always", "zero", "clip", "integer"}
 _KNOB_AXES = ("mul", "add", "top")
@@ -181,6 +183,9 @@ class Method:
     fine: dict[str, Any] | None
     abort: dict[str, Any] | None
     tuned: dict[str, Any] | None
+    combine: dict[str, Any] | None = None
+    """``{base, methods}`` of a combination: the control and the two registry entries
+    whose hook methods its trainer composes (``training.interface.combo_trainer``)."""
 
     @property
     def variants(self) -> list[str] | None:
@@ -336,6 +341,27 @@ def _check_limit(limit: object, where: str) -> str:
     return metric
 
 
+def _check_combine(
+    block: object, base: Mapping[str, Any], where: str
+) -> dict[str, Any] | None:
+    """Validate a ``combine`` block: a base control and two distinct registry names."""
+    if block is None:
+        return None
+    block = _check_keys(block, {"base", "methods"}, f"{where} combine")
+    methods = block.get("methods")
+    if (
+        not isinstance(block.get("base"), str)
+        or not isinstance(methods, list)
+        or len(methods) != 2
+        or not all(isinstance(m, str) for m in methods)
+        or methods[0] == methods[1]
+    ):
+        _fail(f"{where} combine: `base` a control and `methods` two registry names")
+    if base.get("base_from") != f"{block['base']}.tuned":
+        _fail(f"{where} combine: `base` needs `base_from: {block['base']}.tuned`")
+    return block
+
+
 def _by_variant(block: object, variants: Sequence[str] | None) -> bool:
     """Whether an ``abort`` block is keyed by variant (one block per variant)."""
     return (
@@ -387,7 +413,8 @@ def load_method(slug: str, methods_dir: Path = METHODS_DIR) -> Method:
     variant, and ``budgets.<label>.abort`` changes flag rules at that budget, outside
     the hashed config (`Method.abort_rules`). A ``grid.coarse`` entry is ``name``
     plus the keys it overrides (``seeds`` is its seed count at the tuning budget, see
-    `expand_phase`); ``grid.fine`` is in ``expand_fine``.
+    `expand_phase`); ``grid.fine`` is in ``expand_fine``. ``combine`` (`Method.combine`)
+    names the two methods a combination composes; it is not part of the config.
     """
     path = methods_dir / f"{slug}.yaml"
     where = path.name
@@ -411,6 +438,7 @@ def load_method(slug: str, methods_dir: Path = METHODS_DIR) -> Method:
         fine=None if fine is None else _check_fine(fine, where),
         abort=raw.get("abort"),
         tuned=raw.get("tuned"),
+        combine=_check_combine(raw.get("combine"), base, where),
     )
     _check_abort(method.abort, where, method.variants)
     for label, block in budgets.items():  # flags change with the budget, nothing else
@@ -850,7 +878,7 @@ def coarse_results(
     method: str | None = None,
     tracking_uri: str | None = None,
     methods_dir: Path = METHODS_DIR,
-    phases_dir: Path = PHASES_DIR,
+    phases_dir: Path | None = None,
     allow_partial: bool = False,
 ) -> dict[str, float]:
     """Mean final score per config hash over its ``tune-coarse`` seeds, complete only.
@@ -869,7 +897,7 @@ def coarse_results(
         if method in (None, slug, r)
     ]
     expected: dict[str, list[str]] = {}
-    path = phases_dir / f"{COARSE_PHASE}.yaml"
+    path = (phases_dir or PHASES_DIR) / f"{COARSE_PHASE}.yaml"
     for spec in expand_phase(path, method=slug, methods_dir=methods_dir):
         if spec.registry_name in names:
             expected.setdefault(spec.config_hash, []).append(spec.name)
@@ -1029,6 +1057,7 @@ def run_specs(specs: Sequence[RunSpec], args: argparse.Namespace) -> None:
         args.num_workers,
         args.max_runs,
         tracking_uri=args.tracking_uri,
+        seed_from=args.seed_from,
     )
 
 
@@ -1086,6 +1115,13 @@ def phase_specs(
     )
 
 
+def _sqlite_uri(store: str) -> str:
+    """A SQLite file given as a plain path, as an absolute ``sqlite:///`` URI."""
+    if "://" in store or store.startswith("sqlite:"):
+        return store
+    return f"sqlite:///{Path(store).resolve()}"
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Command-line entry point."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
@@ -1117,13 +1153,32 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="store of this worker's runs instead of configs/experiment.yaml's "
         "(a cluster node's own database, merged later by `make merge-mlflow`)",
     )
+    parser.add_argument(
+        "--seed-from",
+        metavar="DB",
+        help="read-only copy of the main store: this worker's runs in it are merged "
+        "into --tracking-uri's store first, and --expand-fine ranks its coarse runs",
+    )
     args = parser.parse_args(argv)
+    if args.seed_from and not args.tracking_uri:
+        parser.error("--seed-from needs --tracking-uri (the node store to seed)")
+    # review p2b I2: MLflow reads a plain path as a file-store directory
+    if args.seed_from:
+        args.seed_from = _sqlite_uri(args.seed_from)
+    if (args.tracking_uri or "").endswith(".db"):
+        args.tracking_uri = _sqlite_uri(args.tracking_uri)
     if args.mark_tuned:
-        print(mark_tuned(*args.mark_tuned, methods_dir=args.methods_dir))
+        tuned = mark_tuned(
+            *args.mark_tuned,
+            tracking_uri=args.tracking_uri,
+            methods_dir=args.methods_dir,
+        )
+        print(tuned)
         return
     if args.phase is None and args.expand_fine is None:
         parser.error("give --phase, --expand-fine or --mark-tuned")
-    specs = phase_specs(args)
+    # review M7: the coarse results come from the store the flags name
+    specs = phase_specs(args, args.seed_from or args.tracking_uri)
     if specs is None:
         return
     if args.dry_run:

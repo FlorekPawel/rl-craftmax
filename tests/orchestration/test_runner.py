@@ -29,6 +29,8 @@ from wut_murl_craftax.orchestration import queue, runner
 from wut_murl_craftax.orchestration.profiles import Profile, load_profile
 from wut_murl_craftax.orchestration.queue import RunSpec, config_hash, expand_phase
 from wut_murl_craftax.orchestration.runner import final_score, worker_specs
+from wut_murl_craftax.orchestration.runtime import BackendError
+from wut_murl_craftax.orchestration.store import merge_stores
 from wut_murl_craftax.orchestration.tracking import artifact_path
 from wut_murl_craftax.training.checkpoints import (
     checkpoint_schedule,
@@ -97,10 +99,12 @@ class Store:
         files = sorted(p.name for p in run_dir.iterdir())
         self.evaluated.append((spec.name, spec.phase, status, files))
 
-    def run(self, specs: list[RunSpec], trainer: Any, **kw: Any) -> None:
+    def run(
+        self, specs: list[RunSpec], trainer: Any, profile: Path = PROFILE, **kw: Any
+    ) -> None:
         runner.main(
             specs,
-            PROFILE,
+            profile,
             experiment_config=self.config,
             methods={"toy": trainer},
             evaluate=self.evaluate,
@@ -185,6 +189,7 @@ def test_fixture_profile_loads() -> None:
         device_roles="cpu-actor",
         memory_limit_bytes=1_000_000_000,
         checkpoint_every=2,
+        unmeasured_limits=(),
     )
 
 
@@ -220,6 +225,68 @@ def test_a_tracking_uri_sends_the_runs_to_another_store(
     assert run.info.run_name == specs[0].name
     assert run.info.status == "FINISHED"
     assert artifact_path(run.info.artifact_uri).is_relative_to(tmp_path / "node")
+
+
+def test_a_node_seeded_from_the_main_store_reuses_and_returns_its_runs(
+    store: Store, tmp_path: Path
+) -> None:
+    """Phase 0 review I5: a node evaluates its worker's reused runs, never retrains
+    them, and the merge brings that evaluation back to the main store."""
+    store.run(store.phase("tune-coarse", ["published", "lr-hi"]), FakeTrainer())
+    final = store.phase("final-1m", ["published", "lr-hi"], eval_mode="log_spaced")
+    node_uri = f"sqlite:///{tmp_path / 'node' / 'mlruns-node-0.db'}"
+
+    def evaluate(run_dir: Path, spec: RunSpec, should_stop: Callable[[], bool]) -> None:
+        (run_dir / "eval" / "log.npz").write_text(spec.phase)
+        mlflow.log_metric("eval/log/return", 1.0, step=7)
+
+    trainer = FakeTrainer()
+    runner.main(
+        final,
+        PROFILE,
+        0,
+        2,
+        experiment_config=store.config,
+        tracking_uri=node_uri,
+        seed_from=store.tracking_uri,
+        methods={"toy": trainer},
+        evaluate=evaluate,
+    )
+    assert trainer.updates == []
+    node = mlflow.MlflowClient(tracking_uri=node_uri)
+    ids = [e.experiment_id for e in node.search_experiments()]
+    assert [r.info.run_name for r in node.search_runs(ids)] == [final[0].name]
+    merge_stores(node_uri, store.tracking_uri)
+    run = store.runs()[final[0].name]
+    assert run.data.tags[queue.TAG_PHASES] == "tune-coarse,final-1m"
+    assert (artifact_path(run.info.artifact_uri) / "eval/log.npz").exists()
+    history = store.client.get_metric_history(run.info.run_id, "eval/log/return")
+    assert [m.step for m in history] == [7]
+
+
+def test_a_stop_during_the_seed_lands_after_it_and_opens_no_run(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review p2b I1: scancel at job start never cuts a seed copy in half."""
+    (coarse,) = store.phase("tune-coarse", ["published"])
+    store.run([coarse], FakeTrainer())
+    final = store.phase("final-1m", ["published", "lr-hi"], eval_mode="log_spaced")
+    node_uri = f"sqlite:///{tmp_path / 'node' / 'mlruns-node-0.db'}"
+
+    def stopped_seed(*args: Any, **kw: Any) -> dict[str, int]:
+        os.kill(os.getpid(), signal.SIGTERM)
+        return merge_stores(*args, **kw)
+
+    monkeypatch.setattr(runner, "merge_stores", stopped_seed)
+    trainer = FakeTrainer()
+    with pytest.raises(SystemExit) as exit_info:
+        store.run(final, trainer, tracking_uri=node_uri, seed_from=store.tracking_uri)
+    assert exit_info.value.code == 128 + signal.SIGTERM
+    assert trainer.updates == []
+    node = mlflow.MlflowClient(tracking_uri=node_uri)
+    (run,) = node.search_runs([e.experiment_id for e in node.search_experiments()])
+    assert (run.info.run_name, run.info.status) == (coarse.name, "FINISHED")
+    assert run.data.tags[queue.TAG_PHASES] == "tune-coarse"  # it never joined
 
 
 def test_max_runs_counts_the_runs_it_trains(store: Store) -> None:
@@ -413,6 +480,24 @@ def test_each_training_segment_records_its_code_version(
     assert tags["code/segments"] == f"{'a' * 12},{'b' * 12}+dirty"
     assert tags["code/changed"] == "true"
     assert f"{spec.name} resumes under commit {'b' * 12}" in caplog.text
+
+
+def test_an_unreadable_state_restarts_the_run_instead_of_failing_every_start(
+    store: Store,
+) -> None:
+    """Review p2b I1: a cut copy's truncated ``state.npz`` must not stall the run."""
+    (spec,) = store.phase("tune-coarse", ["published"])
+    with pytest.raises(SystemExit):
+        store.run([spec], FakeTrainer((2, signal.SIGINT)))
+    state = store.run_dir(spec.name) / "state" / "state.npz"
+    state.write_bytes(state.read_bytes()[:100])
+    trainer = FakeTrainer()
+    store.run([spec], trainer)
+    assert trainer.updates == [1, 2, 3]  # from scratch: the progress was lost
+    run = store.runs()[spec.name]
+    assert run.info.status == "FINISHED"
+    assert run.data.tags["warn/state_unreadable"] == "true"
+    assert (state.parent / "state.unreadable").is_file()
 
 
 def test_a_resume_into_another_state_layout_fails_the_run_clearly(store: Store) -> None:
@@ -949,6 +1034,35 @@ def test_a_recompute_error_in_the_first_minibatch_ends_the_run_for_good(
     assert again.updates == []  # a recompute bug repeats: no retry
 
 
+def test_an_unmeasured_bound_is_retried_once_instead_of_ending_the_run(
+    store: Store, tmp_path: Path
+) -> None:
+    """ctrl-metrics review: the cuda profile has not measured the recompute bound
+    yet, and GPU reductions need not repeat bit for bit, so a hit there is retried."""
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("ppo-rnn", spec)
+    profile = tmp_path / "unmeasured.yaml"
+    text = PROFILE.read_text().replace("[]", "[ppo/ratio_first_mb]")
+    profile.write_text(text)
+
+    def off(u: int) -> dict[str, float]:
+        return ppo_rnn_report(**{"ppo/ratio_first_mb": 1.002 if u == 1 else 1.0})
+
+    first = FakeTrainer(steps_per_update=TEN_UPDATES, extra=off)
+    store.run([spec], first, profile=profile)
+    assert store.runs()[spec.name].info.status == "FAILED"
+    assert tags_of(store, spec.name, "abort/") == {
+        "abort/count": "1",
+        "abort/metric": "ppo/ratio_first_mb",
+        "abort/unmeasured": "ppo/ratio_first_mb",
+        "abort/update": "1",
+    }
+    again = FakeTrainer(steps_per_update=TEN_UPDATES, extra=lambda u: ppo_rnn_report())
+    store.run([spec], again, profile=profile)
+    assert again.updates == list(range(1, 11))
+    assert store.runs()[spec.name].info.status == "FINISHED"
+
+
 def test_a_ratio_within_the_bound_does_not_stop_the_run(store: Store) -> None:
     (spec,) = store.phase("tune-coarse", ["published"])
     spec = under_shipped_rules("ppo-rnn", spec)
@@ -1258,6 +1372,25 @@ def test_each_run_trains_in_its_own_child_process(store: Store) -> None:
     assert len(pids) == 2
     assert str(os.getpid()) not in pids
     assert store.runtime_calls == []  # the parent never sets up JAX
+
+
+def test_a_gpu_profile_without_a_gpu_stops_the_queue_before_any_run(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review M11: the first child finds no GPU, and no run starts on the CPU."""
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")  # inherited by the child
+    gpu = tmp_path / "gpu.yaml"
+    gpu.write_text(PROFILE.read_text().replace("cpu-actor", "gpu"))
+    specs = store.phase("tune-coarse", ["published", "lr-hi"])
+    with pytest.raises(BackendError, match="no GPU backend"):
+        runner.main(
+            specs,
+            gpu,
+            experiment_config=store.config,
+            registry=REGISTRY,
+            evaluate=NO_EVAL,
+        )
+    assert store.runs() == {}
 
 
 def test_a_crashed_child_fails_its_run_and_the_queue_continues(store: Store) -> None:

@@ -20,6 +20,7 @@ import multiprocessing
 import os
 import signal
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -51,6 +52,7 @@ from ..training.checkpoints import (
     missing_checkpoints,
     save_checkpoint,
     save_state,
+    saved_update,
 )
 from ..training.hooks import MEMORY_LIMIT_KEY, MemoryLimitError
 from ..training.records import (
@@ -68,6 +70,7 @@ from .abort import (
     TAG_ABORT_GUARD,
     TAG_ABORT_MEMORY,
     TAG_ABORT_METRIC,
+    TAG_ABORT_UNMEASURED,
     TAG_ABORT_UNREPORTED,
     TAG_ABORT_UPDATE,
     first_nonfinite,
@@ -83,6 +86,7 @@ from .queue import (
     TAG_BUDGET,
     TAG_CONFIG_HASH,
     TAG_EVAL_PENDING,
+    TAG_FAIL_ERROR,
     TAG_METHOD,
     TAG_PHASES,
     TAG_SEED,
@@ -90,12 +94,15 @@ from .queue import (
 )
 from .reproducibility import code_version
 from .runtime import (
+    BackendError,
     DeviceRoles,
+    check_backend,
     configure_runtime,
     device_roles,
     import_craftax,
     select_platforms,
 )
+from .store import TAG_STATE_UNREADABLE, is_partial, merge_stores
 from .tracking import _resolve_tracking_uri, artifact_path, build_mlflow_tracker
 from .train_metrics import (
     compile_seconds,
@@ -116,8 +123,6 @@ TAG_CKPT_MISSING = "ckpt/missing"
 """Run tag: comma-joined updates whose checkpoint file is lost and cannot be rebuilt."""
 TAG_WARN_ARTIFACTS = "warn/artifacts"
 """Run tag: the latest `Trainer.checkpoint_artifacts` failure (update, error)."""
-TAG_FAIL_ERROR = "fail/error"
-"""Run tag: the error of the last failed call (type and message, truncated)."""
 TAG_CODE_COMMIT = "code/commit"
 """Run tag: the git commit the run started training under (``code/dirty`` beside)."""
 TAG_CODE_SEGMENTS = "code/segments"
@@ -146,6 +151,8 @@ REGISTRY = "wut_murl_craftax.training.interface:METHODS"
 """``module:attribute`` of the trainer registry a run's child process imports."""
 _RUN_ID_VARIABLES = ("MLFLOW_RUN_ID", "MLFLOW_ACTIVE_RUN_ID")
 """Environment variables that make MLflow or the tracker reopen a given run."""
+EXIT_NO_BACKEND = 78
+"""Exit code of a child whose machine lacks the profile's backend (EX_CONFIG)."""
 
 
 class ChunkMetrics(TypedDict):
@@ -384,6 +391,7 @@ def find_run(name: str) -> Any:
         filter_string=f"tags.mlflow.runName = '{name}'",
         output_format="list",
     )
+    runs = [r for r in runs if not is_partial(r)]  # a merge a kill cut
     if len(runs) > 1:
         logger.warning("%d runs are named %s; using one", len(runs), name)
     return max(
@@ -526,9 +534,13 @@ def _set_up_jax(
 
     A registry reference is imported after ``configure_runtime``: the trainers import
     Craftax, which starts the JAX backends on import.
+
+    Raises:
+        BackendError: The profile's mode needs a GPU this machine lacks.
     """
     select_platforms(machine.device_roles)
     configure_runtime(host_devices=machine.host_devices)
+    check_backend(machine.device_roles)
     import_craftax()  # before evaluation traces ``init``, which builds the env
     trainers = _imported(methods) if isinstance(methods, str) else methods
     if isinstance(evaluate, str):
@@ -652,12 +664,16 @@ def _checkpoint(
 
 
 def _resume(out: Path, fresh: dict[str, Any], spu: int) -> dict[str, Any]:
-    """The saved state of ``out``, else ``fresh``.
+    """The saved state of ``out``, else ``fresh`` (also for an unreadable one).
 
     A state saved before the online families gets fresh accumulators that count
     env steps from its update on, and the run is tagged `TAG_ONLINE_FROM`.
     """
     if not (out / STATE_FILE).exists():
+        return fresh
+    if saved_update(out) < 0:  # a cut copy: its progress is lost, start afresh
+        (out / STATE_FILE).replace(out / STATE_FILE.with_suffix(".unreadable"))
+        mlflow.set_tag(TAG_STATE_UNREADABLE, "true")
         return fresh
     saved, filled = load_state_filling(out, fresh, added_paths(fresh))
     if filled:
@@ -772,15 +788,22 @@ def _log_final_score(log: RunLog, env: str) -> None:
 
 
 def _mark_abort(
-    previous: Mapping[str, str], abort: _Aborted, rules: Mapping[str, Any] | None
+    previous: Mapping[str, str],
+    abort: _Aborted,
+    rules: Mapping[str, Any] | None,
+    unmeasured: Sequence[str] = (),
 ) -> None:
     """Tag the active run with the abort; the `MAX_ABORTS`-th one marks it a bug.
 
     A guard metric in the method's ``abort.permanent`` (``rules``; a retry would
     break it again) or a metric out of its ``abort.limits`` bounds is tagged
-    `TAG_ABORT_GUARD` at once instead, and the queue skips the run from then on.
+    `TAG_ABORT_GUARD` at once instead, and the queue skips the run from then on;
+    unless the profile has not measured that bound on its devices (``unmeasured``,
+    `Profile.unmeasured_limits`): then it counts as a retried abort, tagged
+    `TAG_ABORT_UNMEASURED`.
     """
-    if abort.bound or abort.metric in (rules or {}).get("permanent", []):
+    soft = abort.bound and abort.metric in unmeasured
+    if not soft and (abort.bound or abort.metric in (rules or {}).get("permanent", [])):
         mlflow.set_tags({
             TAG_ABORT_GUARD: abort.metric,
             TAG_ABORT_METRIC: abort.metric,
@@ -794,6 +817,8 @@ def _mark_abort(
         TAG_ABORT_METRIC: abort.metric,
         TAG_ABORT_UPDATE: str(abort.update),
     }
+    if soft:
+        tags[TAG_ABORT_UNMEASURED] = abort.metric
     if count >= MAX_ABORTS:
         tags[TAG_ABORT_BUG] = "true"
     mlflow.set_tags(tags)
@@ -974,7 +999,8 @@ def _run_spec(
         _close(tracker, "KILLED", trains)
         raise
     except _Aborted as abort:
-        _mark_abort(found.data.tags if found else {}, abort, spec.abort)
+        previous = found.data.tags if found else {}
+        _mark_abort(previous, abort, spec.abort, profile.unmeasured_limits)
         tracker.close("FAILED")  # its last state/ stays for the one retry, if any
         return True
     except MemoryLimitError as error:  # no retry here can fit: skipped from now on
@@ -1026,7 +1052,11 @@ def _child(job: _Job, stop_set: Any, stop_signum: Any, trained: Any, done: Any) 
 
     # before the setup (imports, backends: seconds), so a stop then opens no run
     threading.Thread(target=forwarded, daemon=True).start()
-    trainers, evaluate = _set_up_jax(job.machine, job.registry, job.evaluate)
+    try:
+        trainers, evaluate = _set_up_jax(job.machine, job.registry, job.evaluate)
+    except BackendError:
+        logger.exception("no backend for profile mode %s", job.machine.device_roles)
+        sys.exit(EXIT_NO_BACKEND)  # every later run would fail the same way
     if job.spec.registry_name not in trainers:
         msg = f"no trainer registered for {job.spec.registry_name!r} in {job.registry}"
         raise ValueError(msg)
@@ -1063,6 +1093,7 @@ def _in_child(job: _Job, stop: _Stop) -> bool:
     A signal to this process is forwarded once; a second one kills the child.
 
     Raises:
+        BackendError: The child found no backend for the profile's mode.
         RuntimeError: The child exited non-zero without a signal (its error, or a
             crash such as an OOM kill: the run is then closed FAILED here).
     """
@@ -1084,6 +1115,9 @@ def _in_child(job: _Job, stop: _Stop) -> bool:
             child.join()
         _close_orphan(job.spec.name, "KILLED", "killed by a second signal")
         raise
+    if child.exitcode == EXIT_NO_BACKEND:
+        msg = "the child found no GPU backend for profile mode gpu (see its log)"
+        raise BackendError(msg)
     if child.exitcode and done.value:
         logger.warning(
             "%s: child exited with %d after closing its run",
@@ -1154,6 +1188,18 @@ def _runs_in_children(
     return run
 
 
+def _seed(seed_from: str, node: str, specs: Sequence[RunSpec], stop: _Stop) -> None:
+    """Merge the specs' runs of ``seed_from`` into ``node``; a stop then ends `main`.
+
+    It runs under `main`'s signal handlers: a stop lands after the seed (the merge
+    leaves no half copy, see `merge_stores`) and opens no run.
+    """
+    counts = merge_stores(seed_from, node, names={s.name for s in specs})
+    logger.info("seeded from %s: %s", seed_from, counts)
+    if stop.signum is not None:
+        raise SystemExit(128 + stop.signum)
+
+
 def main(
     specs: Sequence[RunSpec],
     profile: Path | str,
@@ -1163,6 +1209,7 @@ def main(
     *,
     experiment_config: Path = EXPERIMENT_CONFIG,
     tracking_uri: str | None = None,
+    seed_from: str | None = None,
     methods: Mapping[str, Trainer] | None = None,
     evaluate: Evaluate | str | None = None,
     registry: str = REGISTRY,
@@ -1177,6 +1224,9 @@ def main(
     trace. Runs reused as FINISHED do not count towards ``max_runs``. MLflow settings
     come from ``experiment_config``, the experiment name replaced by each spec's
     phase and the tracking URI by ``tracking_uri`` when given (a node's own store).
+    ``seed_from``, a read-only copy of the main store, first merges this worker's runs
+    into the node's (`merge_stores`): the node reuses and resumes them as the main
+    store would, and the merge back returns their new evaluations (review I5).
 
     A run that fails is closed FAILED with its error tagged (`TAG_FAIL_ERROR`) and
     logged, and the next spec runs; runs marked a bug, or failed for lost
@@ -1185,6 +1235,8 @@ def main(
     Raises:
         SystemExit: 128 + the signal number after SIGINT or SIGTERM.
         RuntimeError: At the end, naming every run of this call that failed.
+        ValueError: ``seed_from`` without ``tracking_uri``.
+        BackendError: The profile's mode needs a GPU this machine lacks (at once).
     """
     machine = load_profile(profile)
     mine = worker_specs(specs, worker_index, num_workers)
@@ -1197,6 +1249,9 @@ def main(
             experiment, mlflow=replace(experiment.mlflow, tracking_uri=tracking_uri)
         )
     mlflow.set_tracking_uri(_resolve_tracking_uri(experiment.mlflow.tracking_uri))
+    if seed_from is not None and tracking_uri is None:
+        msg = "seed_from needs tracking_uri: a node store to seed"
+        raise ValueError(msg)
     run_one = (
         _runs_in_children(machine, experiment, registry, evaluate)
         if methods is None
@@ -1204,11 +1259,15 @@ def main(
     )
     trained, failed = 0, []
     with _stop_on_signals() as stop:
+        if seed_from is not None:
+            _seed(seed_from, str(tracking_uri), mine, stop)
         for spec in mine:
             if max_runs is not None and trained >= max_runs:
                 break
             try:
                 trained += run_one(spec, stop)
+            except BackendError:  # every run of this machine would fail the same way
+                raise
             except Exception as error:  # one run must not stop the queue
                 logger.exception("%s failed, next run", spec.name)
                 failed.append(f"{spec.name}: {type(error).__name__}: {error}")
