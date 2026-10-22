@@ -860,6 +860,198 @@ def test_a_flag_needs_consecutive_updates_and_a_later_value_failure_counts(
     assert tags_of(store, spec.name, "flag/") == {"flag/value_failure": "2"}
 
 
+# --- the controls' shipped abort rules --------------------------------------------
+
+TEN_UPDATES = 100_000
+"""Steps per update of a 1m run of 10 updates."""
+
+
+def under_shipped_rules(slug: str, spec: RunSpec) -> RunSpec:
+    """``spec`` with the abort block of the shipped ``configs/methods/<slug>.yaml``."""
+    abort = queue.load_method(slug, REPO / "configs" / "methods").abort
+    return dataclasses.replace(spec, abort=abort)
+
+
+def ppo_rnn_report(**over: float) -> dict[str, float]:
+    """A healthy PPO-RNN update's metrics, with ``over`` replacing some of them."""
+    ok = {
+        "ppo/policy_loss": 0.1,
+        "ppo/value_loss": 0.5,
+        "ppo/approx_kl": 0.01,
+        "ppo/entropy": 2.0,
+        "ppo/explained_variance": 0.5,
+        "ppo/ratio_first_mb": 1.0,
+        "rnn/hidden_saturation": 0.1,
+    }
+    return ok | over
+
+
+def test_a_recompute_error_in_the_first_minibatch_ends_the_run_for_good(
+    store: Store,
+) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("ppo-rnn", spec)
+
+    def off(u: int) -> dict[str, float]:
+        return ppo_rnn_report(**{"ppo/ratio_first_mb": 1.002 if u == 1 else 1.0})
+
+    first = FakeTrainer(steps_per_update=TEN_UPDATES, extra=off)
+    store.run([spec], first)
+    assert first.updates == [1]
+    assert store.runs()[spec.name].info.status == "FAILED"
+    assert tags_of(store, spec.name, "abort/") == {
+        "abort/guard": "ppo/ratio_first_mb",
+        "abort/metric": "ppo/ratio_first_mb",
+        "abort/update": "1",
+    }
+    again = FakeTrainer(steps_per_update=TEN_UPDATES, extra=off)
+    store.run([spec], again)
+    assert again.updates == []  # a recompute bug repeats: no retry
+
+
+def test_a_ratio_within_the_bound_does_not_stop_the_run(store: Store) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("ppo-rnn", spec)
+
+    def near(u: int) -> dict[str, float]:
+        return ppo_rnn_report(**{"ppo/ratio_first_mb": 1.0 + 9e-4 * (-1) ** u})
+
+    trainer = FakeTrainer(steps_per_update=TEN_UPDATES, extra=near)
+    store.run([spec], trainer)
+    assert trainer.updates == list(range(1, 11))
+    assert store.runs()[spec.name].info.status == "FINISHED"
+
+
+def test_ppo_rnn_nan_rules_are_ppos_one_retry_then_a_bug(store: Store) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("ppo-rnn", spec)
+
+    def nan(u: int) -> dict[str, float]:
+        return ppo_rnn_report(**{"ppo/value_loss": math.nan if u == 3 else 0.5})
+
+    store.run([spec], FakeTrainer(steps_per_update=TEN_UPDATES, extra=nan))
+    assert tags_of(store, spec.name, "abort/") == {
+        "abort/count": "1",
+        "abort/metric": "ppo/value_loss",
+        "abort/update": "3",
+    }
+    store.run([spec], FakeTrainer(steps_per_update=TEN_UPDATES, extra=nan))
+    assert tags_of(store, spec.name, "abort/")["abort/bug"] == "true"
+
+
+def test_ppo_rnn_flags_tag_saturation_kl_and_early_entropy_collapse(
+    store: Store,
+) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("ppo-rnn", spec)
+
+    def sick(u: int) -> dict[str, float]:
+        return ppo_rnn_report(**{
+            "rnn/hidden_saturation": 0.95 if u >= 4 else 0.1,  # 5% of 10 updates: 1
+            "ppo/approx_kl": 0.2 if u >= 6 else 0.01,
+            "ppo/entropy": 0.1 if u <= 1 else 2.0,  # before 10% of the budget
+        })
+
+    store.run([spec], FakeTrainer(steps_per_update=TEN_UPDATES, extra=sick))
+    assert store.runs()[spec.name].info.status == "FINISHED"  # flags never stop a run
+    assert tags_of(store, spec.name, "flag/") == {
+        "flag/hidden_saturation": "4",
+        "flag/kl_high": "8",
+        "flag/entropy_collapse": "1",
+    }
+
+
+PQN_COLUMNS = ("value_loss", "grad_norm")
+"""The loss columns PQN-RNN fills; the others are NaN."""
+
+
+def pqn_report(**over: float) -> dict[str, float]:
+    """A healthy PQN-RNN update's metrics, with ``over`` replacing some of them."""
+    ok = {
+        "pqn/td_loss": 1.0,
+        "pqn/q_max_mean": 5.0,
+        "pqn/action_gap": 0.5,
+        "pqn/epsilon": 0.005,
+        "pqn/bn_var_min": 0.5,
+    }
+    return ok | over
+
+
+def pqn_trainer(extra: Callable[[int], dict[str, float]]) -> FakeTrainer:
+    return FakeTrainer(
+        steps_per_update=TEN_UPDATES, extra=extra, loss_columns=PQN_COLUMNS
+    )
+
+
+def test_q_values_above_300_end_a_pqn_run_for_good(store: Store) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("pqn-rnn", spec)
+
+    def blown(u: int) -> dict[str, float]:
+        return pqn_report(**{"pqn/q_max_mean": 400.0 if u == 5 else 300.0})
+
+    first = pqn_trainer(blown)
+    store.run([spec], first)
+    assert first.updates == [1, 2, 3, 4, 5]  # 300 itself is allowed
+    assert store.runs()[spec.name].info.status == "FAILED"
+    assert tags_of(store, spec.name, "abort/") == {
+        "abort/guard": "pqn/q_max_mean",
+        "abort/metric": "pqn/q_max_mean",
+        "abort/update": "5",
+    }
+    again = pqn_trainer(blown)
+    store.run([spec], again)
+    assert again.updates == []  # a divergence repeats: no retry
+
+
+def test_a_nan_td_loss_is_retried_once_before_it_marks_a_pqn_bug(store: Store) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("pqn-rnn", spec)
+
+    def nan(u: int) -> dict[str, float]:
+        return pqn_report(**{"pqn/td_loss": math.nan if u == 2 else 1.0})
+
+    store.run([spec], pqn_trainer(nan))
+    tags = tags_of(store, spec.name, "abort/")
+    assert tags["abort/count"] == "1"
+    assert "abort/guard" not in tags
+    store.run([spec], pqn_trainer(nan))
+    assert tags_of(store, spec.name, "abort/")["abort/bug"] == "true"
+
+
+def test_pqn_flags_tag_a_td_spike_a_flat_gap_at_the_floor_and_a_dead_input(
+    store: Store,
+) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("pqn-rnn", spec)
+
+    def sick(u: int) -> dict[str, float]:
+        return pqn_report(**{
+            "pqn/td_loss": 20.0 if u >= 7 else 1.0,  # 10 x the median for 3 updates
+            "pqn/action_gap": 0.0,  # flat from the start, but epsilon is high
+            "pqn/epsilon": 1.0 if u <= 4 else 0.005,
+            "pqn/bn_var_min": 1e-7 if u >= 9 else 0.5,
+        })
+
+    store.run([spec], pqn_trainer(sick))
+    assert store.runs()[spec.name].info.status == "FINISHED"  # flags never stop a run
+    assert tags_of(store, spec.name, "flag/") == {
+        "flag/td_spike": "9",
+        "flag/action_gap_flat": "7",  # epsilon at its floor from update 5: 3 in a row
+        "flag/bn_var_low": "9",
+    }
+
+
+def test_a_healthy_pqn_run_raises_no_flag(store: Store) -> None:
+    (spec,) = store.phase("tune-coarse", ["published"])
+    spec = under_shipped_rules("pqn-rnn", spec)
+    trainer = pqn_trainer(lambda u: pqn_report())
+    store.run([spec], trainer)
+    assert store.runs()[spec.name].info.status == "FINISHED"
+    assert tags_of(store, spec.name, "flag/") == {}
+    assert tags_of(store, spec.name, "warn/") == {}  # the trainer reports every metric
+
+
 def test_method_metrics_are_logged_at_their_env_step_and_survive_a_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1294,6 +1486,31 @@ def test_a_failing_checkpoint_artifact_warns_and_the_run_finishes(
     assert "checkpoint artifacts of update 2 failed" in caplog.text
     assert [e["update"] for e in load_index(store.run_dir(spec.name))] == [0, 1, 2, 3]
     assert math.isfinite(run.data.metrics["final_score"])
+
+
+def test_a_replayed_checkpoint_chunk_writes_its_artifacts_again(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after checkpoint 2 but before its state save: the resume replays
+    update 2, whose checkpoint is on disk, and its artifacts are written again."""
+    (spec,) = store.phase("tune-coarse", ["published"])
+    real, crashed = runner.save_state, []
+
+    def crash_once_at_2(out: Path, payload: dict[str, Any]) -> None:
+        if payload["update"] == 2 and not crashed:
+            crashed.append(2)
+            msg = "killed"
+            raise OSError(msg)
+        real(out, payload)
+
+    monkeypatch.setattr(runner, "save_state", crash_once_at_2)
+    with pytest.raises(RuntimeError, match="1 of 1 runs failed"):
+        store.run([spec], ArtifactTrainer())
+    assert 2 in {e["update"] for e in load_index(store.run_dir(spec.name))}
+    resumed = ArtifactTrainer()
+    store.run([spec], resumed)
+    assert [u for u, _, _ in resumed.artifact_calls] == [2, 3]
+    assert store.runs()[spec.name].info.status == "FINISHED"
 
 
 def test_a_trainer_without_checkpoint_artifacts_is_unaffected(store: Store) -> None:

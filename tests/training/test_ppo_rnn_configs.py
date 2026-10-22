@@ -101,10 +101,34 @@ def test_fine_holds_the_rule_and_knobs_and_no_entries() -> None:
     assert (knobs["ent"]["mul"], knobs["ent"]["zero"]) == ([0.5, 2.0], [0.001, 0.003])
 
 
-def test_tuned_is_null_and_the_abort_block_is_valid() -> None:
-    assert ppo_rnn().tuned is None
+def test_tuned_is_the_base_and_the_abort_block_is_valid() -> None:
+    assert ppo_rnn().tuned == {}  # tuning kept the published config
+    for budget in ("1m", "1b"):
+        tuned = resolve_config(ppo_rnn(), "ppo-rnn", budget, ref="tuned")
+        assert tuned == resolve_config(ppo_rnn(), "ppo-rnn", budget)
     assert ppo_rnn().abort is not None
     assert ppo_rnn().abort["finite"]
+
+
+def test_abort_rules_are_ppos_plus_the_recompute_bound_and_saturation_flag() -> None:
+    abort = ppo_rnn().abort
+    ppo = load_method("ppo", METHODS).abort
+    assert abort is not None
+    assert ppo is not None
+    assert abort["finite"] == ppo["finite"]
+    assert abort["flags"][:3] == ppo["flags"]  # kl, entropy, value: as PPO
+    assert abort["flags"][3:] == [
+        {
+            "name": "hidden_saturation",
+            "metric": "rnn/hidden_saturation",
+            "above": 0.9,
+            "span": 0.05,
+        }
+    ]
+    assert abort["limits"] == [
+        {"metric": "ppo/ratio_first_mb", "min": 0.999, "max": 1.001}
+    ]
+    assert "permanent" not in abort  # a NaN is retried once; only the limit is final
 
 
 def test_tune_coarse_phase_plans_31_runs() -> None:

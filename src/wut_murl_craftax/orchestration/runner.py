@@ -64,6 +64,7 @@ from .abort import (
     TAG_ABORT_UNREPORTED,
     TAG_ABORT_UPDATE,
     first_nonfinite,
+    first_out_of_bounds,
     flag_hits,
     unreported,
 )
@@ -179,9 +180,9 @@ class Trainer(Protocol):
     the live state, the run directory and the checkpoint's update (also for the final
     one), and the method writes its per-checkpoint files there (by convention under
     ``eval/``; writers replace the rows of an update, so a repeated call is safe). It
-    is not called for the initial checkpoint, for a checkpoint rebuilt from ``state/``
-    nor for one that exists already. It never fails a run: an exception is logged and
-    tagged `TAG_WARN_ARTIFACTS`.
+    is not called for the initial checkpoint nor for one rebuilt from ``state/``; a
+    chunk replayed after a crash calls it again for its checkpoint. It never fails a
+    run: an exception is logged and tagged `TAG_WARN_ARTIFACTS`.
     """
 
     def steps_per_update(self, config: Mapping[str, Any]) -> int:
@@ -374,11 +375,15 @@ def find_run(name: str) -> Any:
 
 
 class _Aborted(Exception):  # noqa: N818 - control flow, not an error of the caller
-    """A chunk reported a non-finite loss: ``update`` (1-based) and ``metric``."""
+    """A chunk broke an abort rule: a non-finite loss, or a metric out of its bounds.
 
-    def __init__(self, update: int, metric: str) -> None:
-        super().__init__(f"{metric} is not finite at update {update}")
-        self.update, self.metric = update, metric
+    ``update`` is 1-based; ``bound`` marks an ``abort.limits`` hit (permanent).
+    """
+
+    def __init__(self, update: int, metric: str, bound: bool = False) -> None:
+        what = "is out of its bounds" if bound else "is not finite"
+        super().__init__(f"{metric} {what} at update {update}")
+        self.update, self.metric, self.bound = update, metric, bound
 
 
 def _loss_columns(trainer: Trainer) -> tuple[str, ...]:
@@ -471,15 +476,20 @@ def _repair_checkpoints(
     return lost
 
 
-def _check_finite(
-    metrics: ChunkMetrics, columns: Sequence[str], finite: Sequence[str], update: int
+def _check_aborts(
+    metrics: ChunkMetrics, columns: Sequence[str], abort: Mapping[str, Any], update: int
 ) -> None:
-    """Raise `_Aborted` on the first non-finite logged loss of the chunk."""
-    hit = first_nonfinite(
-        np.asarray(metrics["losses"], float), columns, _method_metrics(metrics), finite
-    )
-    if hit is not None:
+    """Raise `_Aborted` on the first non-finite logged loss or out-of-bounds metric.
+
+    A non-finite loss comes first, as it ends the run for a retry; a metric out of its
+    ``abort.limits`` bounds is checked only on a finite chunk.
+    """
+    method = _method_metrics(metrics)
+    losses = np.asarray(metrics["losses"], float)
+    if hit := first_nonfinite(losses, columns, method, abort.get("finite", [])):
         raise _Aborted(update + hit[0] + 1, hit[1])
+    if hit := first_out_of_bounds(method, abort.get("limits", [])):
+        raise _Aborted(update + hit[0] + 1, hit[1], bound=True)
 
 
 def _imported(ref: str) -> Any:
@@ -560,6 +570,25 @@ def _checkpoint_artifacts(trainer: Trainer, state: Any, out: Path, update: int) 
         mlflow.set_tag(TAG_WARN_ARTIFACTS, text[:500])
 
 
+def _checkpoint(
+    trainer: Trainer,
+    state: Any,
+    out: Path,
+    update: int,
+    spu: int,
+    wall: float,
+    written: set[int],
+) -> None:
+    """Save checkpoint ``update`` unless ``written``, then its artifacts.
+
+    A chunk replayed after a crash finds its checkpoint written and only rewrites
+    the artifacts (`_checkpoint_artifacts`), so none is lost.
+    """
+    if update not in written:
+        save_checkpoint(out, update, update * spu, wall, trainer.params(state))
+    _checkpoint_artifacts(trainer, state, out, update)
+
+
 def _train(
     trainer: Trainer,
     spec: RunSpec,
@@ -575,7 +604,8 @@ def _train(
     MLflow gets windows of `log_every` updates (`train_metrics`).
 
     Raises:
-        _Aborted: A chunk reported a non-finite loss; nothing of it is saved.
+        _Aborted: A chunk reported a non-finite loss or a metric out of its bounds;
+            nothing of it is saved.
         RuntimeError: The run is complete but checkpoints are lost for good (a lost
             final one is rebuilt from ``state/``).
     """
@@ -601,7 +631,7 @@ def _train(
     written = {e["update"] for e in load_index(out)}
     columns, extras = _loss_columns(trainer), _Extras.load(out, update)
     abort = spec.abort or {}
-    rules, finite, flagged = abort.get("flags", []), abort.get("finite", []), set[str]()
+    rules, flagged = abort.get("flags", []), set[str]()
     t0 = time.monotonic() - saved["wall_s"]
     every, max_reward = log_every(n_updates), float(achievement_weights(spec.env).sum())
     chunks: list[tuple[int, float]] = []
@@ -612,19 +642,21 @@ def _train(
         # dispatch is asynchronous: without waiting, wall_s and SPS time the dispatch
         jax.block_until_ready((state, metrics))  # type: ignore[no-untyped-call]  # jax API
         wall = time.monotonic() - t0
-        _check_finite(metrics, columns, finite, update)
+        _check_aborts(metrics, columns, abort, update)
         chunks.append((n, wall - start))
         _add_updates(log, update, spu, np.linspace(start, wall, n + 1)[1:], metrics)
         extras.extend(update, _method_metrics(metrics))
         if not chunks[
             1:
         ]:  # the first chunk of this call shows what the trainer reports
-            _tag_unreported(unreported(rules, finite, extras.series))
+            names = unreported(
+                rules, abort.get("finite", []), extras.series, abort.get("limits", [])
+            )
+            _tag_unreported(names)
         update += n
         _tag_flags(flag_hits(rules, extras.series, n_updates), flagged)
-        if update in ckpts and update not in written:
-            save_checkpoint(out, update, update * spu, wall, trainer.params(state))
-            _checkpoint_artifacts(trainer, state, out, update)
+        if update in ckpts:
+            _checkpoint(trainer, state, out, update, spu, wall, written)
         extras.save()
         save_state(out, _snapshot(fresh, state, update, wall, log))
         log.flush()
@@ -664,10 +696,10 @@ def _mark_abort(
     """Tag the active run with the abort; the `MAX_ABORTS`-th one marks it a bug.
 
     A guard metric in the method's ``abort.permanent`` (``rules``; a retry would
-    break it again) is tagged `TAG_ABORT_GUARD` at once instead, and the queue
-    skips the run from then on.
+    break it again) or a metric out of its ``abort.limits`` bounds is tagged
+    `TAG_ABORT_GUARD` at once instead, and the queue skips the run from then on.
     """
-    if abort.metric in (rules or {}).get("permanent", []):
+    if abort.bound or abort.metric in (rules or {}).get("permanent", []):
         mlflow.set_tags({
             TAG_ABORT_GUARD: abort.metric,
             TAG_ABORT_METRIC: abort.metric,

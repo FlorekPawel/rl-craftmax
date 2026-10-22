@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import yaml
 from _contract import assert_done_step_unlock_counted
+from _methods import copy_methods
 
 from wut_murl_craftax.orchestration.queue import (
     expand_phase,
@@ -58,15 +59,7 @@ CONFIG_A = "b0.1-recipe-constant"
 @pytest.fixture(scope="module")
 def methods_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Copies of configs/methods with the two controls' ``tuned`` filled in."""
-    out = tmp_path_factory.mktemp("methods")
-    for path in (REPO / "configs" / "methods").glob("*.yaml"):
-        text = path.read_text(encoding="utf-8")
-        if path.stem in TINY:
-            assert text.count("\ntuned: null\n") == 1
-            tuned = yaml.safe_dump({"tuned": TINY[path.stem]}, sort_keys=False)
-            text = text.replace("\ntuned: null\n", "\n" + tuned)
-        (out / path.name).write_text(text, encoding="utf-8")
-    return out
+    return copy_methods(tmp_path_factory.mktemp("methods"), TINY)
 
 
 def _config(methods_dir: Path, variant: str, ref: str = CONFIG_A, **over: Any) -> Any:
@@ -251,13 +244,14 @@ def test_two_updates_report_chunk_and_count_metrics(entry: Any) -> None:
     shapes = {k: np.asarray(v).shape for k, v in m.items()}
     count = {k for k in m if k.startswith("count/")}
     assert {"count/distinct_keys", "count/occupancy"} <= count
+    assert {"rnn/hidden_norm", "reward/extrinsic", "reward/intrinsic"} <= set(m)
     assert shapes == {
         "losses": (2, len(LOSS_COLUMNS)),
         "done": (2, 8, 8),
         "ach": (2, 8, 8, 22),
         "ret": (2, 8, 8),
         "length": (2, 8, 8),
-        **dict.fromkeys(count, (2,)),
+        **{k: (2,) for k in m if "/" in k},  # the control's own metrics come along
     }
     assert all(np.isfinite(np.asarray(m[k], float)).all() for k in count)
 

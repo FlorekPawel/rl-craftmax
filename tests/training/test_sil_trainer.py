@@ -14,6 +14,7 @@ import optax
 import pytest
 import yaml
 from _contract import assert_done_step_unlock_counted
+from _methods import copy_methods
 
 from wut_murl_craftax.orchestration.abort import (
     TAG_ABORT_MEMORY,
@@ -75,14 +76,7 @@ LEARNER_HOOKS = (
 @pytest.fixture(scope="module")
 def methods_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Copies of configs/methods with the PPO-RNN control's ``tuned`` filled in."""
-    out = tmp_path_factory.mktemp("methods")
-    for path in (REPO / "configs" / "methods").glob("*.yaml"):
-        text = path.read_text(encoding="utf-8")
-        if path.stem == "ppo-rnn":
-            tuned = yaml.safe_dump({"tuned": TINY}, sort_keys=False)
-            text = text.replace("\ntuned: null\n", "\n" + tuned)
-        (out / path.name).write_text(text, encoding="utf-8")
-    return out
+    return copy_methods(tmp_path_factory.mktemp("methods"), {"ppo-rnn": TINY})
 
 
 def _config(methods_dir: Path, ref: str = CONFIG, **over: Any) -> dict[str, Any]:
@@ -317,13 +311,20 @@ def test_two_updates_report_chunk_and_sil_metrics(entry: Any) -> None:
     shapes = {k: np.asarray(v).shape for k, v in m.items()}
     names = {k for k in m if k.startswith("sil/")}
     assert {"sil/active", "sil/policy_loss", "sil/inserted", "sil/overflow"} <= names
+    control = {
+        "ppo/entropy",
+        "ppo/ratio_first_mb",
+        "rnn/hidden_norm",
+        "reward/intrinsic",
+    }
+    assert control <= set(m)  # the PPO-RNN control's own metrics come with the method's
     assert shapes == {
         "losses": (2, len(LOSS_COLUMNS)),
         "done": (2, 8, 8),
         "ach": (2, 8, 8, 22),
         "ret": (2, 8, 8),
         "length": (2, 8, 8),
-        **dict.fromkeys(names, (2,)),
+        **{k: (2,) for k in m if "/" in k},
     }
     assert all(np.isfinite(np.asarray(m[k], float)).all() for k in names)
 
@@ -465,6 +466,7 @@ def test_the_abort_list_holds_only_always_finite_metrics() -> None:
     assert load_method("sil").abort == {
         "finite": control["finite"] + own,
         "permanent": ["sil/dominates"],  # the KL streak recurs on a retry
+        "limits": control["limits"],  # the SIL steps follow the PPO epochs: ratio 1
         "flags": control["flags"],  # kl_high watches the off-policy SIL steps
     }
 
