@@ -340,7 +340,8 @@ def load_method(slug: str, methods_dir: Path = METHODS_DIR) -> Method:
     ``base`` is one config block, or one block per variant (every value a mapping) for a
     slug with several registry entries (``<slug>-<variant>``); a block may say
     ``base_from: <slug>.tuned``. A ``grid.coarse`` entry is ``name`` plus the keys it
-    overrides (``seeds`` is its seed count); ``grid.fine`` is in ``expand_fine``.
+    overrides (``seeds`` is its seed count at the tuning budget, see `expand_phase`);
+    ``grid.fine`` is in ``expand_fine``.
     """
     path = methods_dir / f"{slug}.yaml"
     where = path.name
@@ -500,6 +501,8 @@ def _entry_specs(
     for ref, over, item_seeds, grid_seeds in _entry_items(
         entry, method, registry, kw["fine"]
     ):
+        if raw["budget"] != TUNE_BUDGET:  # review M13: tuning seed counts only
+            grid_seeds = None
         order = (item_seeds, entry.get("seeds"), grid_seeds, raw.get("seeds"))
         seeds = next((s for s in order if s is not None), None)
         cfg = resolve_config(
@@ -538,6 +541,7 @@ def expand_phase(
     method: str | None = None,
     methods_dir: Path = METHODS_DIR,
     fine: Fine | None = None,
+    skip_fine: bool = False,
 ) -> list[RunSpec]:
     """Expand a phase file into RunSpecs, one per (entry, config, seed).
 
@@ -547,8 +551,12 @@ def expand_phase(
     configs: <list | coarse | fine>, seeds}``. A ``configs`` item is ``base``, ``tuned``
     (the default list) or a grid entry name, or ``{ref, set: {overrides}, seeds}``;
     ``fine`` takes the configs of ``expand_fine``. Seeds come from the item, the entry,
-    the grid entry, then the phase. ``method`` keeps the entries whose registry name or
-    config slug equals it.
+    the grid entry, then the phase. A grid entry's ``seeds`` is its tuning seed count
+    and counts only at the tuning budget (`TUNE_BUDGET`): a ``final-1b`` phase of
+    ``published-1m`` (10 tuning seeds) runs the phase's ``seeds``. ``method`` keeps
+    the entries whose registry name or config slug equals it. Without ``fine``,
+    ``skip_fine`` leaves out the ``configs: fine`` entries (`fine_registries`) instead
+    of failing.
     """
     keys = {"budget", "eval", "env", "seeds", "runs"}
     raw = _check_keys(_load_yaml(path.read_text(encoding="utf-8")), keys, path.name)
@@ -559,8 +567,11 @@ def expand_phase(
     runs = raw.get("runs")
     if not isinstance(runs, dict) or not runs:
         _fail(f"{path.name}: `runs` must be a non-empty mapping")
+    skipped = fine_registries(path, method) if skip_fine and fine is None else []
     specs: dict[str, RunSpec] = {}
     for registry, entry in runs.items():
+        if registry in skipped:
+            continue
         for spec in _entry_specs(
             raw,
             path,
@@ -573,9 +584,21 @@ def expand_phase(
             if spec.name in specs:
                 _fail(f"{path.name}: duplicate run {spec.name}")
             specs[spec.name] = spec
-    if not specs:
+    if not specs and not skipped:
         _fail(f"{path.name}: no phase entry matches --method {method!r}")
     return list(specs.values())
+
+
+def fine_registries(path: Path, method: str | None = None) -> list[str]:
+    """Registry names of the phase's ``configs: fine`` entries that ``method`` keeps."""
+    runs = _load_yaml(path.read_text(encoding="utf-8")).get("runs") or {}
+    return [
+        registry
+        for registry, entry in runs.items()
+        if isinstance(entry, dict)
+        and entry.get("configs") == "fine"
+        and method in (None, registry, entry.get("config", registry))
+    ]
 
 
 # --- fine rule ------------------------------------------------------------------
@@ -966,13 +989,17 @@ def _print_fine(fine: Fine, slug: str, methods_dir: Path) -> None:
 
 
 def phase_specs(
-    args: argparse.Namespace, tracking_uri: str | None = None
+    args: argparse.Namespace,
+    tracking_uri: str | None = None,
+    *,
+    skip_fine: bool = False,
 ) -> list[RunSpec] | None:
     """The specs of ``args.phase`` (None without one), after ``args.expand_fine``.
 
     ``args`` carries ``phase``, ``method``, ``expand_fine``, ``allow_partial`` and
     ``methods_dir``; the stage-2 configs come from the coarse results in
-    ``tracking_uri`` (the default store when None) and are printed.
+    ``tracking_uri`` (the default store when None) and are printed. ``skip_fine``:
+    see `expand_phase`.
     """
     fine = None
     if args.expand_fine:
@@ -996,7 +1023,11 @@ def phase_specs(
     if args.phase is None:
         return None
     return expand_phase(
-        args.phase, method=args.method, methods_dir=args.methods_dir, fine=fine
+        args.phase,
+        method=args.method,
+        methods_dir=args.methods_dir,
+        fine=fine,
+        skip_fine=skip_fine,
     )
 
 
