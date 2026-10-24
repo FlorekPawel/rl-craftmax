@@ -32,7 +32,9 @@ NOISE = 0.25
 ABLATIONS = (
     ("count-bonus-ppo-rnn", "simhash"),
     ("sil", "single-buffer"),
+    ("smdp-skills", "random-top"),
     ("smdp-skills", "monte-carlo"),
+    ("smdp-skills", "no-flags"),
     ("dyna-q", "kappa0"),
 )
 ABLATION_COST = 0.3
@@ -44,7 +46,14 @@ COLLAPSING = "sil"
 UNLOCKED = ("collect_wood", "place_table")
 """Achievements of the ``first_unlock/*`` curves (never logged by ppo and ppo-rnn)."""
 NOT_LOGGED = ("ppo", "ppo-rnn")
-"""Methods whose runs lack the online families."""
+"""Methods whose runs lack the online families; their 1M runs are reused from
+tune-coarse."""
+TUNE_FINE = ("sil", "smdp-skills")
+"""Methods whose tuned 1M seeds below `TUNING_SEEDS` are reused from tune-fine."""
+TUNING_SEEDS = 3
+RERUN_IN_FINE = "ppo"
+"""Its seeds below `TUNING_SEEDS` are in tune-fine too, though it was selected on all 10
+in tune-coarse (the store's ppo: an artefact the check must not read as optimism)."""
 EVAL_SEEDS = 4
 CAUSE = {"smdp-skills": "zombie"}
 """Cause of death of every death; others die of ``starvation``."""
@@ -68,15 +77,23 @@ def runs_frame(
         scale = 1.0 if budget == "1m" else GROWTH
         for method, ref in units:
             phase = f"{'combo' if method == 'combo' else 'final'}-{budget}"
-            reused = method in NOT_LOGGED and budget == "1m"
+            tuning = ""
+            if budget == "1m" and ref == "tuned":
+                tuning = "tune-coarse" if method in NOT_LOGGED else ""
+                tuning = "tune-fine" if method in TUNE_FINE else tuning
             for seed in range(SEEDS[budget]):
                 score = scale * (
                     LEVEL[method] - ABLATION_COST * (ref != "tuned")
                 ) + rng.normal(0, NOISE * scale)
+                tags = tuning
+                if method == RERUN_IN_FINE and tuning and seed < TUNING_SEEDS:
+                    tags = f"{tuning},tune-fine"
                 rows.append({
                     "run_id": f"{method}-{ref}-{budget}-{seed}",
                     "phase": phase,
-                    "phases": f"tune-coarse,{phase}" if reused else phase,
+                    "phases": f"{tags},{phase}"
+                    if tuning and (seed < TUNING_SEEDS or method in NOT_LOGGED)
+                    else phase,
                     "method": method,
                     "budget": budget,
                     "config_hash": f"{method}/{ref}",
