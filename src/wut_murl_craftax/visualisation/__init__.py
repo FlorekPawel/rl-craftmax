@@ -12,14 +12,17 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # real names for type checkers; runtime imports stay lazy
     from .cuts import gif, long_cut, short_cut
     from .eval_rollouts import (
+        Q_FAMILIES,
         EvalRun,
+        episode_outputs,
         evaluate,
         evaluate_spec,
         load_eval,
+        network_family,
         network_outputs,
         replay_episode,
     )
-    from .overlay import render_overlay
+    from .overlay import render_overlay, value_label
     from .render import render_kept, render_master
     from .review import build_assets, write_page
     from .rollout import (
@@ -35,18 +38,21 @@ if TYPE_CHECKING:  # real names for type checkers; runtime imports stay lazy
 
 _EXPORTS: dict[str, str] = {
     "EvalRun": "eval_rollouts",
+    "Q_FAMILIES": "eval_rollouts",
     "HeuristicPolicy": "rollout",
     "NetworkPolicy": "rollout",
     "Policy": "rollout",
     "RandomPolicy": "rollout",
     "Rollout": "rollout",
     "build_assets": "review",
+    "episode_outputs": "eval_rollouts",
     "evaluate": "eval_rollouts",
     "evaluate_spec": "eval_rollouts",
     "game_for": "rollout",
     "gif": "cuts",
     "load_eval": "eval_rollouts",
     "long_cut": "cuts",
+    "network_family": "eval_rollouts",
     "network_outputs": "eval_rollouts",
     "play": "rollout",
     "render_kept": "render",
@@ -55,12 +61,14 @@ _EXPORTS: dict[str, str] = {
     "replay": "rollout",
     "replay_episode": "eval_rollouts",
     "short_cut": "cuts",
+    "value_label": "overlay",
     "write_page": "review",
 }
 """Public name -> submodule; imported on first access so ``python -m`` runs of a
 submodule do not import it twice."""
 
 __all__ = [
+    "Q_FAMILIES",
     "EvalRun",
     "HeuristicPolicy",
     "NetworkPolicy",
@@ -68,12 +76,14 @@ __all__ = [
     "RandomPolicy",
     "Rollout",
     "build_assets",
+    "episode_outputs",
     "evaluate",
     "evaluate_spec",
     "game_for",
     "gif",
     "load_eval",
     "long_cut",
+    "network_family",
     "network_outputs",
     "play",
     "render_kept",
@@ -82,6 +92,7 @@ __all__ = [
     "replay",
     "replay_episode",
     "short_cut",
+    "value_label",
     "write_page",
 ]
 

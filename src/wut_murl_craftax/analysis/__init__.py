@@ -4,6 +4,13 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # real names for type checkers; runtime imports stay lazy
+    from .literature import (
+        COMPARABLE_BLOCKS,
+        LITERATURE_COLUMNS,
+        LITERATURE_CSV,
+        comparable_rows,
+        load_literature,
+    )
     from .load import (
         BASE_CONTROL,
         CONTROLS,
@@ -25,16 +32,21 @@ if TYPE_CHECKING:  # real names for type checkers; runtime imports stay lazy
 
 _EXPORTS: dict[str, str] = {
     "BASE_CONTROL": "load",
+    "COMPARABLE_BLOCKS": "literature",
     "CONTROLS": "load",
     "FINAL_PHASES": "load",
     "Frames": "load",
+    "LITERATURE_COLUMNS": "literature",
+    "LITERATURE_CSV": "literature",
     "METRICS_ROOT": "load",
     "MissingPhaseError": "load",
     "SchemaError": "load",
     "UNIT_COLUMNS": "load",
     "base_control": "load",
+    "comparable_rows": "literature",
     "final_checkpoint": "load",
     "in_phase": "load",
+    "load_literature": "literature",
     "load_phase": "load",
     "load_phases": "load",
     "pair_of": "load",
@@ -46,16 +58,21 @@ submodule do not import it twice."""
 
 __all__ = [
     "BASE_CONTROL",
+    "COMPARABLE_BLOCKS",
     "CONTROLS",
     "FINAL_PHASES",
+    "LITERATURE_COLUMNS",
+    "LITERATURE_CSV",
     "METRICS_ROOT",
     "UNIT_COLUMNS",
     "Frames",
     "MissingPhaseError",
     "SchemaError",
     "base_control",
+    "comparable_rows",
     "final_checkpoint",
     "in_phase",
+    "load_literature",
     "load_phase",
     "load_phases",
     "pair_of",
