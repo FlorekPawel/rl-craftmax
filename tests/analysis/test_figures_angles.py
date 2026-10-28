@@ -33,7 +33,7 @@ from matplotlib.figure import Figure
 from matplotlib.text import Text
 from scipy import stats as sps
 
-from wut_murl_craftax.analysis import compare
+from wut_murl_craftax.analysis import compare, figures_angles
 from wut_murl_craftax.analysis.figures_angles import (
     ANGLE_FIGURES,
     GATE_MIN,
@@ -285,7 +285,7 @@ def test_the_gap_line_is_the_mean_gap_over_seeds(
 
 
 def naive_lift(eps: pd.DataFrame, method: str, run: str, ach: str) -> float:
-    """The lift of `gatekeepers` by a plain loop over the episodes."""
+    """The landmark lift by a plain loop: A held at the landmark, not A ever."""
     names = [c.removeprefix("ach/") for c in eps.columns if c.startswith("ach/")]
     mine = eps[eps["method"] == method]
     at = float(np.median(mine.loc[mine[f"ach/{ach}"], f"unlock_step/{ach}"]))
@@ -296,7 +296,8 @@ def naive_lift(eps: pd.DataFrame, method: str, run: str, ach: str) -> float:
             for b in names
             if b != ach
         )
-        groups[bool(e[f"ach/{ach}"])].append(later)
+        held = bool(e[f"ach/{ach}"]) and e[f"unlock_step/{ach}"] <= at
+        groups[held].append(later)
     if not groups[True] or not groups[False]:
         return float("nan")
     return float(np.mean(groups[True]) - np.mean(groups[False]))
@@ -332,8 +333,43 @@ def test_episodes_dead_before_the_median_unlock_are_left_out() -> None:
     })
     row = gatekeepers(eps).set_index("achievement").loc["a"]
     assert row["at"] == 20
-    assert (row["with_a"], row["without_a"]) == (2, 1)
-    assert row["lift"] == pytest.approx(0.5 - 1.0)  # with the dead one it would be 0
+    # only episode 0 holds a by step 20; 1 (a at 30) and 2 have not yet, 3 is dead
+    assert (row["with_a"], row["without_a"]) == (1, 2)
+    assert row["lift"] == pytest.approx(0.0 - 1.0)  # with the dead one: 0 - 2/3
+
+
+def test_a_late_unlock_counts_as_not_yet_at_the_landmark() -> None:
+    """Grouping by A ever would give -0.5 here; the landmark grouping gives +0.5."""
+    eps = pd.DataFrame({
+        "method": "sil",
+        "run_id": "r",
+        "length": [100, 100, 100],
+        "ach/a": [True, True, False],
+        "unlock_step/a": [10, 30, -1],
+        "ach/b": [True, False, True],
+        "unlock_step/b": [50, -1, 40],
+    })
+    row = gatekeepers(eps).set_index("achievement").loc["a"]
+    assert row["lift"] == pytest.approx(1.0 - 0.5)
+
+
+def test_an_achievement_without_effect_has_no_lift() -> None:
+    """Null world: constant-hazard death, six achievements at independent times."""
+    rng = np.random.default_rng(3)
+    n, names = 4000, [f"x{i}" for i in range(6)]
+    length = rng.geometric(1 / 300, n)
+    frame = {"method": "sil", "run_id": np.repeat([f"r{k}" for k in range(8)], n // 8)}
+    frame["length"] = length
+    for name in names:
+        step = rng.exponential(250, n).astype(int) + 1
+        got = step <= length
+        frame[f"ach/{name}"] = got
+        frame[f"unlock_step/{name}"] = np.where(got, step, -1)
+    table = gatekeepers(pd.DataFrame(frame))
+    means = table.groupby("achievement")["lift"].mean()
+    # sampling noise only: grouping by "A ever" gives about +1.0 in this world
+    assert means.abs().max() < 0.2, means
+    assert abs(means.mean()) < 0.05, means
 
 
 def test_a_gatekeeper_dot_is_the_mean_lift_over_seeds(
@@ -351,6 +387,15 @@ def test_a_gatekeeper_dot_is_the_mean_lift_over_seeds(
         assert seeds[["with_a", "without_a"]].sum().min() >= GATE_MIN
         want = seeds["lift"].mean()
         assert float(dot.get_xdata()[0]) == pytest.approx(want)  # type: ignore[attr-defined]
+
+
+def test_gatekeeper_rows_no_method_can_fill_are_named_not_drawn(
+    frames: dict[str, pd.DataFrame], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(figures_angles, "GATE_MIN", 10_000)
+    fig = plot_gatekeepers(frames, tmp_path, n_boot=N)
+    assert not artists(fig, "gate")
+    assert "no method has 10000 alive episodes" in said(fig)
 
 
 # --- F23 fate -----------------------------------------------------------------------
@@ -399,7 +444,14 @@ def test_ablation_effects_are_the_ablation_table_differences(
         dot = by_gid(fig, f"effect/{key}")
         assert float(dot.get_xdata()[0]) == pytest.approx(r.diff)  # type: ignore[attr-defined]
         seeds = by_gid(fig, f"seeds/{key}")
-        assert len(seeds.get_offsets()) == r.seeds  # type: ignore[attr-defined]
+        runs = frames["runs"][frames["runs"]["budget"] == r.benchmark]
+        tuned = runs[(runs["method"] == r.method) & (runs["config_ref"] == "tuned")]
+        mine = runs[(runs["method"] == r.method) & (runs["config_ref"] == r.config_ref)]
+        want = mine["final_score"] - tuned["final_score"].mean()
+        np.testing.assert_allclose(
+            sorted(seeds.get_offsets()[:, 0]),
+            sorted(want),  # type: ignore[attr-defined]
+        )
     assert "PoI" in said(fig)
 
 
@@ -460,6 +512,16 @@ def test_a_legend_of_long_labels_drops_columns_to_fit(
     assert legend.x1 <= fig.bbox.x1
 
 
+def test_a_one_entry_legend_becomes_a_note(
+    frames: dict[str, pd.DataFrame], tmp_path: Path
+) -> None:
+    table = optimism_table(frames)
+    table = table[table["method"] != "dyna-q"]
+    fig = plot_tuning_optimism(frames, tmp_path, n_boot=N, table=table)
+    assert not fig.legends
+    assert "Shown: sil (" in said(fig)
+
+
 # --- F26 episode spread -------------------------------------------------------------
 
 
@@ -480,7 +542,24 @@ def test_episode_spread_shares_and_length_profile(
         for k, s in share.items():
             assert grid[i, int(k)] == pytest.approx(s)
         assert np.nansum(grid[i]) == pytest.approx(1.0)
-    assert artists(fig, "length")
+    # mean triangles: the method's mean achievements, at the centre of its count cell
+    for method in rows:
+        mean = eps.loc[eps["method"] == method, "n_achievements"].mean()
+        tri = by_gid(fig, f"mean/1m/{method}")
+        assert float(tri.get_xdata()[0]) == pytest.approx(mean + 0.5)  # type: ignore[attr-defined]
+    # length lines: the mean achievements of the method's episodes in each bin of the
+    # benchmark's equal-count length bins, at the bin's median length
+    edges = np.unique(np.quantile(eps["length"], np.linspace(0, 1, 9)))
+    for method in ("sil", "dyna-q"):
+        mine = eps[eps["method"] == method]
+        cut = pd.cut(mine["length"], edges, include_lowest=True)
+        want = mine.groupby(cut, observed=True).agg(
+            x=("length", "median"), y=("n_achievements", "mean"), n=("length", "size")
+        )
+        want = want[want["n"] >= 10]
+        line = by_gid(fig, f"length/1m/{method}")
+        np.testing.assert_allclose(line.get_xdata(), want["x"])  # type: ignore[attr-defined]
+        np.testing.assert_allclose(line.get_ydata(), want["y"])  # type: ignore[attr-defined]
 
 
 # --- F27 and F28 distillation -------------------------------------------------------
