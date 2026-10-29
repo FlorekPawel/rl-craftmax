@@ -9,6 +9,7 @@ from its own pair. Parquet-only use imports neither JAX nor MLflow: the registry
 is imported by the functions that need it.
 """
 
+import contextlib
 import functools
 import json
 import logging
@@ -160,15 +161,27 @@ class SchemaError(ValueError):
     """An export table breaks the contract (a column, the run key, the phase tag)."""
 
 
-def write_text_atomic(path: Path, text: str) -> None:
-    """Write ``path`` through a temporary file of this process, then replace it.
+@contextlib.contextmanager
+def atomic_path(path: Path) -> Iterator[Path]:
+    """A temporary file of this process beside ``path``, which it replaces on success.
 
     A reader (or a rerun after a kill) sees the old file or the whole new one; the
-    process id keeps two writers from sharing a temporary file.
+    process id keeps two writers from sharing a temporary file. An error in the block
+    (a full disk, say) removes the temporary file; a kill cannot, and leaves it.
     """
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text)
-    tmp.replace(path)
+    try:
+        yield tmp
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through `atomic_path`."""
+    with atomic_path(path) as tmp:
+        tmp.write_text(text)
 
 
 def in_phase(runs: pd.DataFrame, phase: str) -> pd.Series:
