@@ -4,27 +4,6 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-HOOKS = ROOT / "scripts" / "hooks"
-
-CURSOR = {"cursor_version": "2.5", "conversation_id": "c1"}
-CLAUDE = {"session_id": "s1", "hook_event_name": "PreToolUse"}
-
-HAVE_TOOLS = shutil.which("bash") is not None and shutil.which("jq") is not None
-
-
-def run_hook(
-    script: Path, payload: dict[str, object], cwd: Path | None = None
-) -> subprocess.CompletedProcess[str]:
-    """Run ``script`` with ``payload`` as JSON on stdin."""
-    return subprocess.run(
-        ["bash", str(script)],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        cwd=cwd or ROOT,
-        timeout=120,
-        check=False,
-    )
 
 
 def git(cwd: Path, *args: str) -> None:

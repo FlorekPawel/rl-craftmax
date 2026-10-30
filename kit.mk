@@ -12,8 +12,8 @@ SYNC_ARGS ?= --all-groups
 HOOK_TYPES ?= --hook-type pre-commit --hook-type commit-msg --hook-type pre-push
 TEST_ARGS ?=
 
-.PHONY: help install upgrade-check upgrade upgrade-pin clean prek prek-all tests \
-	check
+.PHONY: help install upgrade-check upgrade upgrade-pin clean prek prek-all tests tests-changed push-check \
+	check setup
 
 help: ## Show available targets
 	@printf "Available targets:\n"
@@ -28,6 +28,8 @@ install: ## Set up the development environment
 	else \
 		echo "Secondary worktree: git hooks are shared and tied to one venv; run 'make install' in the main checkout."; \
 	fi
+
+setup: install tests ## Environment and hooks, then the tests
 
 upgrade-check: ## List outdated packages, action pins and uv
 	uv run python scripts/upgrade.py --check
@@ -55,9 +57,13 @@ prek-all: ## Run git hook checks on all files
 tests: ## Run the test suite
 	uv run pytest $(TEST_ARGS)
 
-push-check: ## Pre-push: tests + prek-all
-	$(MAKE) tests
+tests-changed: ## Run only the tests the branch's changes can reach (whole suite when unsure)
+	uv run python scripts/select_tests.py -- $(TEST_ARGS)
+
+push-check: ## Pre-push: the changed tests, then all quality hooks (CI runs every test)
+	$(MAKE) tests-changed
 	$(MAKE) prek-all
 
 check: ## Tests and all quality hooks
-	$(MAKE) push-check
+	$(MAKE) tests
+	$(MAKE) prek-all
