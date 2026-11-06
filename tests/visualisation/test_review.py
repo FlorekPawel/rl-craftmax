@@ -24,6 +24,7 @@ ROW = {
     "seconds": "3.6",
     "speed": "1",
     "events": "fight:x; death:y",
+    "scenes": "",
 }
 
 
