@@ -190,3 +190,17 @@ def test_audio_mix_ducks_music_and_normalises(tmp_path: Path) -> None:
     silent = tmp_path / "silent.mp4"
     ffmpeg.mux_audio(video, silent)
     assert ffmpeg.duration(silent) == pytest.approx(8.0, abs=0.1)
+
+
+@needs_ffmpeg
+def test_segments_last_the_sum_of_their_durations(tmp_path: Path) -> None:
+    out = cuts.cut_clip(
+        {**ROW, "type": "stall", "speed": "8"},
+        "land",
+        classic_master(),
+        tmp_path,
+        segments=[(0, 39, 8), (40, 59, 1)],
+    )
+    # 40 frames at 8x = 0.5 s, 20 frames at 1x = 2 s
+    assert ffmpeg.duration(out) == pytest.approx(2.5, abs=1 / 60 + 1e-3)
+    assert ffmpeg.probe(out)["streams"][0]["height"] == 1080
