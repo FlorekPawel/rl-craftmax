@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Craftax results</title>
+<style>
+:root { --bg:#fff; --fg:#1b1f24; --muted:#59636e; --line:#d1d9e0; --accent:#0969da; --card:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --line:#30363d; --accent:#4493f8; --card:#161b22; }
+}
+body { margin:0 auto; max-width:1000px; padding:16px; background:var(--bg); color:var(--fg); font:16px/1.55 system-ui, sans-serif; }
+a { color:var(--accent); }
+nav { display:flex; gap:4px; flex-wrap:wrap; border-bottom:1px solid var(--line); margin:16px 0; }
+nav button { background:none; border:0; border-bottom:2px solid transparent; color:var(--muted); padding:8px 10px; font:inherit; cursor:pointer; }
+nav button[aria-selected="true"] { color:var(--fg); border-color:var(--accent); }
+section[hidden] { display:none; }
+.scroll { overflow-x:auto; }
+table { border-collapse:collapse; font-size:14px; }
+th, td { border:1px solid var(--line); padding:4px 8px; text-align:left; white-space:nowrap; }
+img, video { max-width:100%; height:auto; }
+figure img, img.legend { background:#fff; border-radius:4px; }  /* figures have transparent backgrounds and dark text */
+img.legend { display:block; margin:8px 0; }
+figure { margin:0; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:8px; }
+figcaption, .small { color:var(--muted); font-size:14px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; }
+.note { background:var(--card); border-left:3px solid var(--accent); padding:8px 12px; margin:12px 0; }
+</style>
+</head>
+<body>
+<h1>Craftax results</h1>
+<p>Course project for <em>Mathematical Underpinning of Reinforcement Learning</em> (Warsaw University of Technology). We trained three published agents and four methods of our own on Craftax, a much harder, crafting-heavy relative of Crafter, and compared them at 1 million and 1 billion environment steps. This page shows what came out. Scores are always the training-episode return in % of the 226-point maximum, so 2.2 means about 5 points per episode.</p>
+<nav role="tablist">
+  <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+  <button role="tab" data-tab="m1" aria-selected="false">Results at 1M</button>
+  <button role="tab" data-tab="b1" aria-selected="false">Results at 1B</button>
+  <button role="tab" data-tab="scale" aria-selected="false">1M vs 1B</button>
+  <button role="tab" data-tab="methods" aria-selected="false">Methods</button>
+  <button role="tab" data-tab="game" aria-selected="false">Game and achievements</button>
+  <button role="tab" data-tab="trees" aria-selected="false">Decision trees</button>
+  <button role="tab" data-tab="media" aria-selected="false">Videos and links</button>
+</nav>
+
+<section id="overview">
+  <h2>What we found</h2>
+  <ul>
+    <li>At 1M steps the PPO family wins, but not by much. Count-bonus PPO-RNN has the best mean (2.27%), yet its gap to plain PPO (2.17%) and PPO-RNN (2.19%) is within seed noise (probability of improvement 0.74 and 0.68, Holm-adjusted p of 0.53 and 1.0).</li>
+    <li>The value-based PQN-RNN family (1.36% and 1.48%) and the two skill methods (Dyna-Q 1.08%, SMDP skills 0.83%) are clearly worse and much less stable across seeds.</li>
+    <li>At 1B steps (only 3 seeds, so indicative) the controls catch up with everything we added: PPO-RNN, PQN-RNN and count-bonus PPO-RNN all land at about 16%, PPO stays at 11.7%, and the skill methods stay near 8-9%.</li>
+    <li>Our add-ons (count bonus, self-imitation, their combination) did not give a reliable gain over their base control at either budget. Self-imitation is the only one whose change at 1B excludes zero, and it is negative.</li>
+    <li>Even the best agents never leave the first floor in the final evaluation episodes, and 47 to 54 of the 67 achievements are never unlocked by any seed. Zombies are the most common cause of death for every method.</li>
+  </ul>
+  <div class="note">One caveat on the reproduction check: our PPO and PQN-RNN controls match the published numbers, but PPO-RNN at 1B scores 16.2% against the published 15.3%, slightly above the tolerance band. We kept the number and say so in the report.</div>
+</section>
+
+<section id="m1" hidden>
+  <h2>Results at 1M steps</h2>
+  <p>10 seeds per method, tuned hyperparameters. Mean with standard error and the interquartile mean (IQM); "eval" columns are the final checkpoint played with a sampled (stochastic) or arg-max (greedy) policy.</p>
+  <img class="legend" src="data/figures/legend.png" alt="Colour legend of the methods: ppo, ppo-rnn and pqn-rnn are grey and dashed, count-bonus-ppo-rnn dark blue, count-bonus-pqn-rnn light blue, sil green, combo purple, dyna-q red, smdp-skills brown, ablations dotted with hollow markers">
+  <div class="scroll" data-csv="data/tables/1m_main.csv" data-cols="method,role,seeds,mean,se,iqm,eval_stochastic,eval_greedy"></div>
+  <div class="grid">
+    <figure><img src="data/figures/1m_aggregate.png" alt="Final score per method with confidence intervals" loading="lazy"><figcaption>Final score per method: IQM (circle) and mean (diamond) with 95% bootstrap intervals. The main block is on top, the skill methods below with the controls repeated.</figcaption></figure>
+    <figure><img src="data/figures/1m_curves_main.png" alt="Learning curves of the main block" loading="lazy"><figcaption>Training score over environment steps for the controls (dashed) and our methods; the band is a 95% bootstrap interval over seeds.</figcaption></figure>
+    <figure><img src="data/figures/1m_curves_skills.png" alt="Learning curves of the skill methods" loading="lazy"><figcaption>The same curves for the two methods that use hand-written skills, against the controls.</figcaption></figure>
+  </div>
+  <p><b>Reading.</b> The curves of the PPO family overlap for most of the run, which is why the final intervals overlap. The PQN-RNN and skill curves are lower and their bands are wide: a few seeds collapsed during training. Combining the count bonus with self-imitation (combo) did not add up: it ended below count-bonus PPO-RNN alone.</p>
+  <h3>Literature</h3>
+  <div class="scroll" data-csv="data/tables/literature.csv" data-cols="name,source,protocol,seeds,score_pct,ci_lo,ci_hi"></div>
+</section>
+
+<section id="b1" hidden>
+  <h2>Results at 1B steps</h2>
+  <p>3 seeds per method, so treat the order of close methods as unresolved.</p>
+  <img class="legend" src="data/figures/legend.png" alt="Colour legend of the methods: ppo, ppo-rnn and pqn-rnn are grey and dashed, count-bonus-ppo-rnn dark blue, count-bonus-pqn-rnn light blue, sil green, combo purple, dyna-q red, smdp-skills brown, ablations dotted with hollow markers">
+  <div class="scroll" data-csv="data/tables/1b_main.csv" data-cols="method,role,seeds,mean,se,median,eval_stochastic,eval_greedy"></div>
+  <div class="grid">
+    <figure><img src="data/figures/1b_aggregate.png" alt="Final score per method at 1B" loading="lazy"><figcaption>Final score per method at 1B, with 95% bootstrap intervals over the three seeds.</figcaption></figure>
+    <figure><img src="data/figures/1b_curves_main.png" alt="Learning curves at 1B, main block" loading="lazy"><figcaption>Training score over 1B steps for the controls and our methods.</figcaption></figure>
+    <figure><img src="data/figures/1b_curves_skills.png" alt="Learning curves at 1B, skill methods" loading="lazy"><figcaption>The same for the skill methods.</figcaption></figure>
+  </div>
+  <p><b>Reading.</b> Four methods end within about one point of each other, so we cannot rank them. PPO without memory is clearly behind, and both skill methods are behind by a factor of about two. The skill methods gain a factor of 8 to 10 from 1M to 1B, similar to the neural agents, so the gap stays.</p>
+</section>
+
+<section id="scale" hidden>
+  <h2>Does the 1M ranking carry over to 1B?</h2>
+  <img class="legend" src="data/figures/legend.png" alt="Colour legend of the methods: ppo, ppo-rnn and pqn-rnn are grey and dashed, count-bonus-ppo-rnn dark blue, count-bonus-pqn-rnn light blue, sil green, combo purple, dyna-q red, smdp-skills brown, ablations dotted with hollow markers">
+  <div class="grid">
+    <figure><img src="data/figures/scale_scores.png" alt="Scores at 1M against 1B" loading="lazy"><figcaption>Mean final score at both budgets on log axes. A rising cloud means the order is kept. Gains from 1M to 1B range from about 5x (PPO) to 12x (PQN-RNN).</figcaption></figure>
+    <figure><img src="data/figures/scale_advantage.png" alt="Advantage over the control at 1M and 1B" loading="lazy"><figcaption>Gain over the base control at each budget. On the dashed diagonal the advantage is unchanged; below it the method loses ground at 1B.</figcaption></figure>
+    <figure><img src="data/figures/scale_speed.png" alt="Learning speed at 1M and 1B" loading="lazy"><figcaption>Share of the budget at which the smoothed score reaches 90% of its final value. Below the diagonal a method gets there earlier at 1B.</figcaption></figure>
+  </div>
+  <p><b>Reading.</b> The ranking mostly survives: the skill methods stay at the bottom and the recurrent agents stay at the top, but the PQN-RNN family, which was far behind at 1M, closes the gap completely. The small advantages we saw at 1M vanish at 1B (the points sit on or below the diagonal), and self-imitation is the one case where the loss is clearly different from zero. In relative terms combo, count-bonus PPO-RNN, PPO, PPO-RNN and self-imitation reach 90% of their final score later at 1B than at 1M.</p>
+</section>
+
+<section id="methods" hidden>
+  <h2>Three baselines and four methods</h2>
+  <img class="legend" src="data/figures/legend.png" alt="Colour legend of the methods: ppo, ppo-rnn and pqn-rnn are grey and dashed, count-bonus-ppo-rnn dark blue, count-bonus-pqn-rnn light blue, sil green, combo purple, dyna-q red, smdp-skills brown, ablations dotted with hollow markers">
+  <h3>Baselines (published agents, rerun with our code)</h3>
+  <ul>
+    <li><b>PPO</b> (<span class="small">ppo</span>): feed-forward Proximal Policy Optimisation, the MLP baseline of the Craftax paper. Every PPO-based method starts from its tuned settings.</li>
+    <li><b>PPO-RNN</b> (<span class="small">ppo-rnn</span>): PPO with a GRU memory, the strongest baseline in the Craftax paper. It is the base of the count bonus and of self-imitation.</li>
+    <li><b>PQN-RNN</b> (<span class="small">pqn-rnn</span>): a recurrent Parallelised Q-Network, the only value-based baseline. It learns online with Q(lambda) from the batch it just collected, with no replay buffer and no target network.</li>
+  </ul>
+  <h3>Our methods</h3>
+  <ul>
+    <li><b>Count-based progress bonus</b> (<span class="small">count-bonus-ppo-rnn, count-bonus-pqn-rnn</span>): an intrinsic reward &beta;/&radic;N over a hand-chosen summary of game progress (floor, tools, armour, spells, bucketed inventory), counted over the whole run and added to the environment reward of a PPO-RNN or PQN-RNN agent. The network never sees the counts.</li>
+    <li><b>Self-imitation learning</b> (<span class="small">sil</span>): PPO-RNN plus a buffer of the steps that led up to each achievement, and an extra loss that copies a stored action only where what followed turned out better than the critic expected.</li>
+    <li><b>SMDP Q-learning over hand-defined skills</b> (<span class="small">smdp-skills</span>): two levels. A table over progress keys picks one of 25 skills with semi-Markov Q-learning; one shared recurrent network learns how to carry out all skills from their own success signals.</li>
+    <li><b>Dyna-Q over a skill-level model</b> (<span class="small">dyna-q</span>): the same skills, plus a learned lookup-table model of what each skill does from each progress key, used for Dyna-Q style planning updates.</li>
+    <li><b>combo</b>: count bonus and self-imitation together on PPO-RNN, tested to see whether the two ideas add up.</li>
+  </ul>
+  <div class="note"><b>Where the 25 skills come from.</b> We wrote them by hand from the game rules and the achievement list (collect wood, craft a pickaxe, place a table, descend a ladder, fight, and so on). Each has a start condition, a success test and a step limit. They were not extracted from data or from anyone's play. Twenty-three are learned skills and two are one-step primitive options. This is prior knowledge the skill methods get and the others do not, so we always report them in a separate block.</div>
+</section>
+
+<section id="game" hidden>
+  <h2>The game: 67 achievements in four tiers</h2>
+  <p>An achievement pays out once per episode, the first time it becomes true. Rewards by tier: 25 basic achievements at 1 point, 18 intermediate at 3, 15 advanced at 5 and 9 very advanced at 8, so 25 + 54 + 75 + 72 = 226 points. The step reward also adds 0.1 times the health change.</p>
+  <details><summary><b>Basic</b> (25 achievements, 1 point each)</summary><p class="small">collect wood, place table, eat cow, collect sapling, collect drink, make wood pickaxe, make wood sword, place plant, defeat zombie, collect stone, place stone, eat plant, defeat skeleton, make stone pickaxe, make stone sword, wake up, place furnace, collect coal, collect iron, collect diamond, make iron pickaxe, make iron sword, make arrow, make torch, place torch</p></details>
+  <details><summary><b>Intermediate</b> (18 achievements, 3 points each)</summary><p class="small">make diamond sword, make iron armour, make diamond armour, enter gnomish mines, enter dungeon, defeat gnome warrior, defeat gnome archer, defeat orc soldier, defeat orc mage, eat bat, eat snail, find bow, fire bow, collect sapphire, collect ruby, make diamond pickaxe, open chest, drink potion</p></details>
+  <details><summary><b>Advanced</b> (15 achievements, 5 points each)</summary><p class="small">enter sewers, enter vault, enter troll mines, defeat lizard, defeat kobold, defeat troll, defeat deep thing, learn fireball, cast fireball, learn iceball, cast iceball, enchant sword, enchant armour, defeat knight, defeat archer</p></details>
+  <details><summary><b>Very advanced</b> (9 achievements, 8 points each)</summary><p class="small">enter fire realm, enter ice realm, enter graveyard, defeat pigman, defeat fire elemental, defeat frost troll, defeat ice elemental, damage necromancer, defeat necromancer</p></details>
+  <h3>What the agents actually do</h3>
+  <img class="legend" src="data/figures/legend.png" alt="Colour legend of the methods: ppo, ppo-rnn and pqn-rnn are grey and dashed, count-bonus-ppo-rnn dark blue, count-bonus-pqn-rnn light blue, sil green, combo purple, dyna-q red, smdp-skills brown, ablations dotted with hollow markers">
+  <div class="grid">
+    <figure><img src="data/figures/1m_advanced.png" alt="Advanced achievements at the end of training" loading="lazy"><figcaption>Share of episodes at the end of training in which each advanced achievement is unlocked. Eight of them are never reached at all.</figcaption></figure>
+    <figure><img src="data/figures/1m_deaths.png" alt="Cause of death per method" loading="lazy"><figcaption>Cause of death in the final evaluation episodes, per method.</figcaption></figure>
+  </div>
+  <p><b>Reading.</b> In the final evaluation episodes every method stays on the first floor: nobody gets down the ladder. Zombies are the most common cause of death for every method (47 to 61% of deaths depending on the method), so staying alive on the first floor is the practical bottleneck at these budgets.</p>
+</section>
+
+<section id="trees" hidden>
+  <h2>What do the policies do? Decision trees</h2>
+  <p>We distilled every trained network (9 methods, 10 seeds each, final 1M checkpoint) into decision trees on named game features and measured fidelity: how often the tree picks the same greedy action as the network on 64 held-out episodes.</p>
+  <img class="legend" src="data/figures/legend.png" alt="Colour legend of the methods: ppo, ppo-rnn and pqn-rnn are grey and dashed, count-bonus-ppo-rnn dark blue, count-bonus-pqn-rnn light blue, sil green, combo purple, dyna-q red, smdp-skills brown, ablations dotted with hollow markers">
+  <div class="grid">
+    <figure><img src="data/figures/1m_fidelity.png" alt="Tree fidelity against number of leaves" loading="lazy"><figcaption>Fidelity of the trees against their number of leaves (log axis), median over seeds. The muted line is the 0.9 level, which no method reaches.</figcaption></figure>
+  </div>
+  <ul>
+    <li>Fidelity peaks at only 0.40 to 0.51, with 32 to 256 leaves, and falls for bigger trees. The 90% level is not reached by any method (above 4096 leaves for nearly all). So the policies are not simple rules in disguise, and the low number is not a labelling bug: we checked it.</li>
+    <li>Trees do better than just predicting the most common action (gains of about 0.1 to 0.19), and best on the "do" action: facing water or a tree and interacting.</li>
+    <li>Small trees still read sensibly. PPO reacts to the distance to water first (the most important feature), then the distance to trees and food. Crafting happens only next to a table. Recurrent policies split first on the previous action, so their rules read as "what to do after X".</li>
+    <li>Rare actions such as sleeping, placing a table, descending or using potions and spells are almost never captured by the trees, even at 256 leaves.</li>
+    <li>Played in the game, 256-leaf trees score much less than the networks they imitate (for PPO about a third of the greedy network score), so matching actions on visited states does not mean matching behaviour. A round of DAgger helped PPO's tree (0.34 to 0.48).</li>
+  </ul>
+</section>
+
+<section id="media" hidden>
+  <h2>Videos</h2>
+  <p>The videos follow the learning process and the most interesting moments. They are MP4 files in the dataset (MIT licence); the music is generated for the project and the narration is synthetic.</p>
+  <div class="grid">
+    <figure><video controls preload="none" src="https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results/resolve/main/media/videos/short_3min_land.mp4"></video><figcaption>Short version, landscape (3 min)</figcaption></figure>
+    <figure><video controls preload="none" src="https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results/resolve/main/media/videos/short_3min_vert.mp4"></video><figcaption>Short version, vertical (3 min)</figcaption></figure>
+    <figure><video controls preload="none" src="https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results/resolve/main/media/videos/grid_2x2.mp4"></video><figcaption>Four agents side by side</figcaption></figure>
+    <figure><video controls preload="none" src="https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results/resolve/main/media/videos/long_12min.mp4"></video><figcaption>Long version (12 min)</figcaption></figure>
+  </div>
+  <h3>GIFs</h3><div class="grid" id="gifs"></div>
+  <h2>Data and code</h2>
+  <ul>
+    <li><a href="https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results">Dataset</a>: MLflow store, per-run metrics, analysis, decision-tree rules and final checkpoints (MIT).</li>
+    <li><a href="https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results/blob/main/report/report.pdf">Report (PDF)</a></li>
+    <li><a href="https://github.com/Pawlo77/rl-craftmax">Code</a></li>
+  </ul>
+  <pre>hf download Pawlo77/wut-murl-craftax-results --repo-type dataset --local-dir craftax-results
+mlflow ui --backend-store-uri sqlite:///craftax-results/mlruns.db</pre>
+</section>
+
+<script>
+// Minimal CSV reader: quoted fields, commas and doubled quotes.
+function parseCsv(text) {
+  const rows = []; let row = [], cell = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else cell += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ",") { row.push(cell); cell = ""; }
+    else if (c === "\n") { row.push(cell); rows.push(row); row = []; cell = ""; }
+    else if (c !== "\r") cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+
+// Keep the listed columns; round numbers to two decimals.
+function toTable(rows, cols) {
+  const keep = cols ? cols.split(",").map(c => rows[0].indexOf(c)).filter(i => i >= 0) : rows[0].map((_, i) => i);
+  const table = document.createElement("table");
+  rows.forEach((r, i) => {
+    const tr = table.insertRow();
+    keep.forEach(j => {
+      const td = document.createElement(i ? "td" : "th");
+      const v = r[j] ?? "";
+      td.textContent = i && v !== "" && !isNaN(v) && v.includes(".") ? (+v).toFixed(2) : v;
+      tr.appendChild(td);
+    });
+  });
+  return table;
+}
+
+document.querySelectorAll("[data-csv]").forEach(async el => {
+  const res = await fetch(el.dataset.csv);
+  el.replaceChildren(toTable(parseCsv(await res.text()), el.dataset.cols));
+});
+
+fetch("manifest.json").then(r => r.json()).then(files => {
+  const box = document.getElementById("gifs");
+  files.filter(f => f.path.startsWith("data/gifs/")).forEach(f => {
+    const img = document.createElement("img"); img.src = f.path; img.alt = "Episode GIF"; box.appendChild(img);
+  });
+});
+
+document.querySelectorAll("nav button").forEach(btn => btn.addEventListener("click", () => {
+  document.querySelectorAll("nav button").forEach(b => b.setAttribute("aria-selected", b === btn));
+  document.querySelectorAll("section").forEach(s => { s.hidden = s.id !== btn.dataset.tab; });
+}));
+</script>
+</body>
+</html>

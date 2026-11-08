@@ -60,6 +60,12 @@ dependencies = [
   "tqdm>=4.67.0",
 ]
 
+[project.optional-dependencies]
+# Publishing the results to Hugging Face (release/publish.py).
+release = [
+  "huggingface_hub>=1.0.0,<2",
+]
+
 [project.urls]
 Homepage = "https://github.com/Pawlo77/rl-craftmax"
 Repository = "https://github.com/Pawlo77/rl-craftmax"
