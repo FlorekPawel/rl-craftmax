@@ -33,6 +33,8 @@ COLUMNS = (
     "speed",
     "events",
     "scenes",
+    "brightness",
+    "moving",
 )
 """Review CSV columns; add new ones at the end only (every step reads them by name)."""
 TEMPLATE = Path(__file__).with_name("review_template.html")

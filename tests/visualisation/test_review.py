@@ -25,6 +25,8 @@ ROW = {
     "speed": "1",
     "events": "fight:x; death:y",
     "scenes": "",
+    "brightness": "",
+    "moving": "",
 }
 
 

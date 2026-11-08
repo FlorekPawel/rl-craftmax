@@ -63,7 +63,7 @@ def test_the_light_theme_has_its_own_surface_ink_muted_and_grid() -> None:
     assert contrast(charts.INK_LIGHT, charts.SURFACE_LIGHT) >= 7
     assert contrast(charts.MUTED_LIGHT, charts.SURFACE_LIGHT) >= 4.5
     assert charts.GRID_LIGHT != charts.SURFACE_LIGHT
-    assert charts.SURFACE == "#1a1a19"  # the dark constants stay as they were
+    assert charts.SURFACE == "#0b1020"  # the video canvas of the slides
 
 
 @pytest.mark.parametrize(

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 import matplotlib as mpl
+import matplotlib.font_manager
 import numpy as np
 import seaborn as sns
 from cycler import cycler
@@ -32,19 +33,21 @@ from matplotlib.layout_engine import ConstrainedLayoutEngine
 from matplotlib.text import Text
 from matplotlib.ticker import MaxNLocator
 
-SURFACE = "#1a1a19"
+from .text import FONT_DIRS
+
+SURFACE = "#0b1020"
 """Chart background (dark surface)."""
-INK = "#f0efec"
+INK = "#eef1f8"
 """Primary text and highlighted lines."""
-INK2 = "#c3c2b7"
+INK2 = "#c9d0e4"
 """Secondary text."""
-MUTED = "#898781"
+MUTED = "#9aa4bf"
 """Axes, tick labels, reference lines."""
-GRID = "#2c2c2a"
+GRID = "#243052"
 """Gridlines and faint tracks."""
 SERIES = ("#3987e5", "#d95926", "#199e70", "#c98500")
 """Categorical slots 1-4 for checkpoints, validated for colour-vision deficiency."""
-SEQ = ("#1a1a19", "#104281", "#1c5cab", "#3987e5", "#86b6ef", "#cde2fb")
+SEQ = ("#0b1020", "#104281", "#1c5cab", "#3987e5", "#86b6ef", "#cde2fb")
 """One-hue blue ramp for magnitudes, starting at the surface colour."""
 SURFACE_LIGHT = "#ffffff"
 """Chart background of the report theme."""
@@ -93,8 +96,19 @@ def ema(x: np.ndarray, alpha: float = 0.05) -> np.ndarray:
     return out
 
 
+def _use_video_font() -> None:
+    """Draw video charts in the font of the slides (Arial) when it is installed."""
+    for d in FONT_DIRS:
+        path = d / "Arial.ttf"
+        if path.exists():
+            mpl.font_manager.fontManager.addfont(str(path))
+            mpl.rcParams["font.family"] = "Arial"
+            return
+
+
 def figure(width: int, height: int) -> Figure:
     """A pyplot-free figure of ``width`` x ``height`` pixels on the dark surface."""
+    _use_video_font()
     fig = Figure(figsize=(width / 100, height / 100), dpi=100, facecolor=SURFACE)
     FigureCanvasAgg(fig)
     return fig
