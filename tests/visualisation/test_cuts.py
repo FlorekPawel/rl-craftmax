@@ -193,6 +193,26 @@ def test_audio_mix_ducks_music_and_normalises(tmp_path: Path) -> None:
 
 
 @needs_ffmpeg
+def test_music_fades_out_over_the_end(tmp_path: Path) -> None:
+    video = tmp_path / "v.mp4"
+    ffmpeg.run([
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=320x180:r=60:d=8",
+        *ffmpeg.LOSSLESS_YUV,
+        video,
+    ])
+    voice = _tone(tmp_path / "voice.wav", 300, 1.5)
+    music = _tone(tmp_path / "music.wav", 1000, 8)
+    out = tmp_path / "mixed.mp4"
+    ffmpeg.mux_audio(video, out, voice=voice, music=music)
+    body = _band_level(out, 1000, 3.5, 4.5)
+    tail = _band_level(out, 1000, 7.4, 7.9)
+    assert body - tail > 10  # the bed dies away instead of being cut
+
+
+@needs_ffmpeg
 def test_segments_last_the_sum_of_their_durations(tmp_path: Path) -> None:
     out = cuts.cut_clip(
         {**ROW, "type": "stall", "speed": "8"},
