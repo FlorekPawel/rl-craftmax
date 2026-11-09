@@ -57,6 +57,7 @@ OUTPUT_DIRS = (
 def link(src: Path, dst: Path) -> None:
     """Hard link where possible (the staged copy costs no disk), else copy."""
     dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.unlink(missing_ok=True)  # a restage replaces the old link
     try:
         os.link(src, dst)
     except OSError:

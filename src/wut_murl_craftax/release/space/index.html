@@ -55,24 +55,25 @@ figcaption, .small { color:var(--muted); font-size:14px; }
 
 <section id="m1" hidden>
   <h2>Results at 1M steps</h2>
-  <p>10 seeds per method, tuned hyperparameters. Mean with standard error and the interquartile mean (IQM); "eval" columns are the final checkpoint played with a sampled (stochastic) or arg-max (greedy) policy.</p>
+  <p>10 seeds per method, tuned hyperparameters. Mean with standard error and the interquartile mean (IQM); "eval" columns are the final checkpoint played with a sampled (stochastic) or arg-max (greedy) policy. The block column says which comparison a row belongs to: the same three controls (same runs) appear in both blocks, so each group of methods sits next to them.</p>
+  <div class="scroll" data-csv="data/tables/1m_main.csv" data-cols="block,method,role,seeds,mean,se,iqm,eval_stochastic,eval_greedy"></div>
   <img class="legend" src="data/figures/legend.png" alt="Colour legend of the methods: ppo, ppo-rnn and pqn-rnn are grey and dashed, count-bonus-ppo-rnn dark blue, count-bonus-pqn-rnn light blue, sil green, combo purple, dyna-q red, smdp-skills brown, ablations dotted with hollow markers">
-  <div class="scroll" data-csv="data/tables/1m_main.csv" data-cols="method,role,seeds,mean,se,iqm,eval_stochastic,eval_greedy"></div>
   <div class="grid">
     <figure><img src="data/figures/1m_aggregate.png" alt="Final score per method with confidence intervals" loading="lazy"><figcaption>Final score per method: IQM (circle) and mean (diamond) with 95% bootstrap intervals. The main block is on top, the skill methods below with the controls repeated.</figcaption></figure>
     <figure><img src="data/figures/1m_curves_main.png" alt="Learning curves of the main block" loading="lazy"><figcaption>Training score over environment steps for the controls (dashed) and our methods; the band is a 95% bootstrap interval over seeds.</figcaption></figure>
     <figure><img src="data/figures/1m_curves_skills.png" alt="Learning curves of the skill methods" loading="lazy"><figcaption>The same curves for the two methods that use hand-written skills, against the controls.</figcaption></figure>
   </div>
   <p><b>Reading.</b> The curves of the PPO family overlap for most of the run, which is why the final intervals overlap. The PQN-RNN and skill curves are lower and their bands are wide: a few seeds collapsed during training. Combining the count bonus with self-imitation (combo) did not add up: it ended below count-bonus PPO-RNN alone.</p>
-  <h3>Literature</h3>
+  <h3>Our runs next to published scores</h3>
+  <p>Final training score at 1M steps in % of the 226-point maximum, with a 95% interval. Rows marked <i>ours</i> are our runs; rows marked <i>literature</i> are values reported in the papers named in the first column. The evaluation protocols differ (see the protocol column), so read this as an orientation, not as a like-for-like ranking.</p>
   <div class="scroll" data-csv="data/tables/literature.csv" data-cols="name,source,protocol,seeds,score_pct,ci_lo,ci_hi"></div>
 </section>
 
 <section id="b1" hidden>
   <h2>Results at 1B steps</h2>
   <p>3 seeds per method, so treat the order of close methods as unresolved.</p>
+  <div class="scroll" data-csv="data/tables/1b_main.csv" data-cols="block,method,role,seeds,mean,se,median,eval_stochastic,eval_greedy"></div>
   <img class="legend" src="data/figures/legend.png" alt="Colour legend of the methods: ppo, ppo-rnn and pqn-rnn are grey and dashed, count-bonus-ppo-rnn dark blue, count-bonus-pqn-rnn light blue, sil green, combo purple, dyna-q red, smdp-skills brown, ablations dotted with hollow markers">
-  <div class="scroll" data-csv="data/tables/1b_main.csv" data-cols="method,role,seeds,mean,se,median,eval_stochastic,eval_greedy"></div>
   <div class="grid">
     <figure><img src="data/figures/1b_aggregate.png" alt="Final score per method at 1B" loading="lazy"><figcaption>Final score per method at 1B, with 95% bootstrap intervals over the three seeds.</figcaption></figure>
     <figure><img src="data/figures/1b_curves_main.png" alt="Learning curves at 1B, main block" loading="lazy"><figcaption>Training score over 1B steps for the controls and our methods.</figcaption></figure>
