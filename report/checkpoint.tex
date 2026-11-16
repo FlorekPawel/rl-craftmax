@@ -5,11 +5,11 @@
 \usepackage{hyperref}
 \usepackage{enumitem}
 \setlist{nosep,leftmargin=*}
-\setlist[description]{labelindent=0pt,leftmargin=1.2em,itemsep=2pt}
+\setlist[description]{labelindent=0pt,leftmargin=1.2em,itemsep=3pt}
 \input{numbers}
 
-\title{Checkpoint: reinforcement learning on Craftax}
-\author{Pawe{\l} Pozorski\\{\small\href{mailto:pawel.pozorski.stud@pw.edu.pl}{pawel.pozorski.stud@pw.edu.pl}}}
+\title{Checkpoint: can an RL agent get further in Craftax?}
+\author{Pawe{\l} Pozorski, Pawe{\l} Florek, Jan Cwalina\\{\small\texttt{\{pawel.pozorski, pawel.florek, jan.cwalina\}.stud@pw.edu.pl}}}
 \date{}
 
 \begin{document}
@@ -20,43 +20,78 @@
 \section*{1. Problem, objective and repository}
 
 \begin{description}
-\item[Problem.] Craftax is a survival game in which an agent gathers resources, crafts tools and descends through nine floors. It has 67 achievements worth at most 226 points, which makes it a hard test of exploration and long-term planning. Agents are compared at one million (1M) and one billion (1B) steps.
-\item[Objective.] Do ideas that help exploration and learning from experience also help on Craftax? We compare three standard agents (PPO, PPO with memory, PQN with memory) with four additions: a bonus for reaching new stages of the game, self-imitation, Q-learning over hand-written skills, and Dyna-Q over those skills. We also ask whether the ranking at 1M still holds at 1B.
-\item[Repository.] \url{https://github.com/Pawlo77/rl-craftmax} (public); the README explains how to install and run it.
+\item[Problem.] Craftax is a Minecraft-like survival game written in JAX, fast enough to train an agent for a billion steps. The agent sees a 9\,$\times$\,11 window of the map around it (in our setting as a vector of 8\,268 numbers), picks one of 43 actions, and has to keep its health, food, water and energy up while it collects wood and stone, crafts tools, fights monsters and enchants gear. The world has nine floors, each 48\,$\times$\,48 tiles: the overworld, a dungeon, the gnomish mines, the sewers, the vaults, the troll mines, a fire realm, an ice realm and finally a graveyard with the boss. To go down a floor the agent has to find the ladder and kill enough monsters to open it. An episode ends when the agent dies or after 100\,000 steps.
+\item[Reward.] There are 67 achievements in four tiers (25 worth 1 point, 18 worth 3, 15 worth 5, 9 worth 8), 226 points in total, each paid once per episode. Almost nobody gets far: published agents score a few percent after a million steps and about 15\,\% after a billion. In our runs none of the evaluation episodes at 1M gets below the dungeon, so the game is mostly a test of exploration.
+\item[Objective.] We wanted to see whether the usual tricks for exploration and for learning from past experience help here, or whether a plain agent with some memory is already as good as it gets. We start from three standard agents (PPO, PPO with a recurrent layer, PQN with a recurrent layer) and plan to bolt four ideas onto them: a bonus for reaching new stages of the game, self-imitation, Q-learning over hand-written skills, and Dyna-Q on top of those skills. Everything is run at one million (1M) and one billion (1B) steps, so we can also ask whether what works at 1M still works at 1B.
+\item[Repository.] \url{https://github.com/Pawlo77/rl-craftmax}, public. The README says how to install it and how to repeat a run.
 \end{description}
+
+\begin{center}
+\includegraphics[height=4.3cm]{figures/checkpoint/checkpoint_game1.png}\hspace{1.2em}\includegraphics[height=4.3cm]{figures/checkpoint/checkpoint_game2.png}\\[2pt]
+{\footnotesize Two frames of the overworld, the first floor (our own renders). Left: the start of an episode. Right: a zombie\\ next to the player; the bars under the map are health, food, water, energy and mana.}
+\end{center}
 
 \section*{2. Minimal experiment}
 
 \begin{description}
-\item[Environment and agent.] Craftax-Symbolic, which gives the agent a compact vector description of the world, and a PPO agent as the baseline.
-\item[What we ran.] PPO for one million steps on 10 seeds, with every metric logged to MLflow; one command in the README repeats it.
-\item[Performance.] The score is the mean return over the last 2\,\% of training, as a share of the 226 points. PPO reaches \scoreOneMPpo\,\% $\pm$ \scoreSeOneMPpo\ (mean $\pm$ standard error). The published value is 2.2\,\%, so the baseline is reproduced.
+\item[Setup.] We use Craftax-Symbolic, where the observation is a vector instead of pixels, and start with plain PPO because every other agent is a change to it. Ten seeds, 1M steps, every metric logged to MLflow. After \texttt{make install}, \texttt{make queue PHASE=final-1m METHOD=ppo} repeats the ten runs (\texttt{make train-ppo} gives a single quick one) and \texttt{make mlflow} opens the logged curves.
+\item[Score.] We take the mean return over the last 2\,\% of training and divide by 226, so a score is a percentage of the maximum. PPO ends at \scoreOneMPpo\,\% $\pm$ \scoreSeOneMPpo\ (mean $\pm$ standard error) and the published number is 2.2\,\%, so the baseline matches the paper and we did not have to hunt for a bug before going further.
+\item[The other two baselines.] PPO-RNN and PQN-RNN went through the same protocol, then the same agents at 1B steps. The table has all three, next to the numbers from the paper where one exists.
 \end{description}
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+ & \multicolumn{2}{c}{1M steps, 10 seeds} & \multicolumn{2}{c}{1B steps, 3 seeds} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Score (\% of max) & ours & paper & ours & paper \\
+\midrule
+PPO     & \scoreOneMPpo\ $\pm$ \scoreSeOneMPpo       & 2.2 & \scoreOneBPpo\ $\pm$ \scoreSeOneBPpo       & 11.9 \\
+PPO-RNN & \scoreOneMPpoRnn\ $\pm$ \scoreSeOneMPpoRnn & 2.3 & \scoreOneBPpoRnn\ $\pm$ \scoreSeOneBPpoRnn & 15.3 \\
+PQN-RNN & \scoreOneMPqnRnn\ $\pm$ \scoreSeOneMPqnRnn & --  & \scoreOneBPqnRnn\ $\pm$ \scoreSeOneBPqnRnn & 16.0 \\
+\bottomrule
+\end{tabular}\\[2pt]
+{\footnotesize Mean $\pm$ standard error over seeds. The paper has no PQN-RNN number at 1M.}
+\end{center}
+
+\begin{description}
+\item[Compute.] The two budgets differ by a factor of 1\,000, and it shows. The 1M runs ran on one of our laptops, an Apple M4 Pro (rollouts on the CPU cores, network updates on its Metal GPU), and a run takes a few minutes. All 1B runs ran on the faculty's EDEN cluster, one GPU, two CPU cores and 12 to 16\,GB of RAM per run, and a run takes hours: PPO and PPO-RNN on an NVIDIA A100-SXM4-40GB (DGX nodes), PQN-RNN on an NVIDIA H100 PCIe (the hopper node). The two GPU types differ in speed, so the 1B times of different methods are not strictly comparable. The laptop speeds are measured with two runs sharing the machine, so they are on the low side. For comparison, a single 1B run of PPO-RNN on the laptop would take about four days.
+\end{description}
+
+\begin{center}
+\begin{tabular}{lrrrrrr}
+\toprule
+ & \multicolumn{2}{c}{1M, laptop (per run)} & \multicolumn{4}{c}{1B, cluster GPU (per run)} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-7}
+ & steps/s & time & steps/s & time & GPU (memory) & all 3 seeds \\
+\midrule
+PPO     & 4\,300 & 3.8 min & 75\,000 & 3.7 h & A100 (33 GB) & 11 h \\
+PPO-RNN & 3\,100 & 5.7 min & 58\,000 & 4.9 h & A100 (33 GB) & 15 h \\
+PQN-RNN & 2\,500 & 7.0 min & 80\,000 & 3.5 h & H100 (65 GB) & 10 h \\
+\bottomrule
+\end{tabular}\\[2pt]
+{\footnotesize Laptop: Apple M4 Pro; A100 = A100-SXM4-40GB, H100 = H100 PCIe, both on EDEN. Time is wall clock including compilation. The three baselines alone cost 36 GPU-hours at 1B (9 runs)\\ and under 3 hours of laptop time at 1M (30 runs).}
+\end{center}
 
 \section*{3. Initial result and its limitations}
 
 \begin{center}
-\begin{tabular}{lrrr}
-\toprule
-Score at 1M (\%, 10 seeds) & PPO & PPO-RNN & PQN-RNN \\
-\midrule
-Mean $\pm$ s.e. & \scoreOneMPpo\ $\pm$ \scoreSeOneMPpo & \scoreOneMPpoRnn\ $\pm$ \scoreSeOneMPpoRnn & \scoreOneMPqnRnn\ $\pm$ \scoreSeOneMPqnRnn \\
-\bottomrule
-\end{tabular}
+\includegraphics[width=\textwidth]{figures/checkpoint/checkpoint_curves.png}\\[-2pt]
+{\footnotesize Training score of the three baselines (mean over seeds, band = 95\,\% bootstrap interval).}
 \end{center}
 
 \begin{description}
-\item[Result.] The three baselines are reproduced at 1M, and PPO and PPO-RNN end almost level. Adding the progress bonus to PPO-RNN scores highest (\scoreOneMCountBonusPpoRnn\,\%), but not significantly higher (probability of improvement \poiOneMCountBonusPpoRnnPpoRnn, Holm $p=\pHolmOneMCountBonusPpoRnnPpoRnn$). The skill methods score lowest. First runs at 1B, with three seeds, point the same way: PQN-RNN catches up with PPO-RNN.
-\item[Limitations.] The 1B results rest on three seeds, so we report intervals and no tests. The 1B settings were not tuned separately. The two budgets ran on different hardware and software, and a check on the cluster showed no difference beyond seed noise.
+\item[Result.] All three baselines land within the margin of the published numbers, with one exception we come back to below. Two things surprised us. At 1M memory hardly matters: PPO and PPO-RNN end level, while PQN-RNN first gets worse for about 200k steps before it starts to climb, and ends last. At 1B the picture flips. PPO falls far behind at \scoreOneBPpo\,\%, and PQN-RNN catches up with PPO-RNN (\scoreOneBPqnRnn\ against \scoreOneBPpoRnn\,\%). So the ranking at 1M says little about the ranking at 1B, which is the reason we run both budgets.
+\item[Limitations.] At 1B we can only afford three seeds, so we report intervals and no tests, and the 1B numbers are indicative. Our PPO-RNN at 1B is a bit above the published 15.3, by more than the seed noise; we looked for a bug, found none, and note it as a difference. The 1B settings were not tuned, we reused the 1M ones. The two budgets also ran on different machines (our laptops, then the faculty GPU cluster); a rerun on the cluster gave scores within seed noise, but it is one more thing to keep in mind.
 \end{description}
 
 \section*{4. Plan and division of work}
 
 \begin{description}
-\item[Next experiments.] Finish the ablations at 1B (Dyna-Q without its exploration bonus and three variants of the skill method), then compare the ranking at both budgets.
-\item[Deliverables.] A 3-page report, a short and a long video, and a public release of the results and an interactive demo on Hugging Face.
-\item[Possible extensions.] Tune the methods at 1B, run more seeds, learn the progress summary instead of choosing it by hand, and add the intrinsic-reward baselines RND and E3B.
-\item[Division of work.] One author, Pawe{\l} Pozorski, covers experiments, analysis, report and videos.
+\item[Next experiments.] The four additions are what is left. Each one is added to the baselines it fits, run for 1M steps on 10 seeds (a few hours of laptop time) and then for 1B steps on 3 seeds (roughly 10 to 15 GPU-hours per method, like the baselines), and compared with its own unmodified control under the same protocol. The part we are most curious about is the skills, since the skill list is written by hand and may simply be a bad guess. If time allows we also combine the two additions that work best, and run the 1B ablations (Dyna-Q without its exploration bonus, variants of the skill list).
+\item[Deliverables.] A 3-page report, a short and a long video, and a public release of the code, results and a small demo.
+\item[Possible extensions.] Tuning at 1B, more seeds, learning the progress summary instead of choosing it by hand, and the intrinsic-reward baselines RND and E3B.
+\item[Division of work.] Pawe{\l} Pozorski built the baselines, the experiment pipeline and the analysis, and keeps running the 1B jobs on the cluster. Pawe{\l} Florek takes the progress bonus and self-imitation, Jan Cwalina the hand-written skills with Q-learning and Dyna-Q; each of us runs, tunes and describes our own methods. The report sections and the videos follow the same split, and Pawe{\l} Pozorski merges and checks the numbers.
 \end{description}
 
 \end{document}

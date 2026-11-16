@@ -176,13 +176,16 @@ TABLE_CAPTIONS: dict[str, TableCaption] = {
         "Hardware",
         "Run medians per hardware profile (steps per second, wall-clock, compile time, "
         "memory, utilisation); profiles are never compared, laptop timings are context "
-        "only.",
+        "only. Devices: laptop = Apple M4 Pro (CPU actors, Metal GPU); cuda = one "
+        "NVIDIA A100-SXM4-40GB (DGX nodes) or H100 PCIe (hopper node) of the EDEN "
+        "cluster per run, read from each run's `sys.gpu` tag.",
     ),
     "stability_hardware": TableCaption(
         "T5",
         "Stability and hardware",
         "Seed sd, drawdown, drops and collapses beside steady steps per second, "
-        "wall-clock and memory, per profile and block (LaTeX table).",
+        "wall-clock and memory, per profile and block (LaTeX table); devices as in "
+        "the hardware table.",
     ),
     "game_summary": TableCaption(
         "T6",
