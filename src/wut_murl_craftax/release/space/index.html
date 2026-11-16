@@ -21,6 +21,7 @@ th, td { border:1px solid var(--line); padding:4px 8px; text-align:left; white-s
 img, video { max-width:100%; height:auto; }
 figure img, img.legend { background:#fff; border-radius:4px; }  /* figures have transparent backgrounds and dark text */
 img.legend { display:block; margin:8px 0; }
+pre { overflow-x:auto; }
 figure { margin:0; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:8px; }
 figcaption, .small { color:var(--muted); font-size:14px; }
 .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; }
@@ -38,7 +39,8 @@ figcaption, .small { color:var(--muted); font-size:14px; }
   <button role="tab" data-tab="methods" aria-selected="false">Methods</button>
   <button role="tab" data-tab="game" aria-selected="false">Game and achievements</button>
   <button role="tab" data-tab="trees" aria-selected="false">Decision trees</button>
-  <button role="tab" data-tab="media" aria-selected="false">Videos and links</button>
+  <button role="tab" data-tab="media" aria-selected="false">Videos</button>
+  <button role="tab" data-tab="code" aria-selected="false">Data and code</button>
 </nav>
 
 <section id="overview">
@@ -155,6 +157,9 @@ figcaption, .small { color:var(--muted); font-size:14px; }
     <figure><video controls preload="none" src="https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results/resolve/main/media/videos/long_12min.mp4"></video><figcaption>Long version (12 min)</figcaption></figure>
   </div>
   <h3>GIFs</h3><div class="grid" id="gifs"></div>
+</section>
+
+<section id="code" hidden>
   <h2>Data and code</h2>
   <ul>
     <li><a href="https://huggingface.co/datasets/Pawlo77/wut-murl-craftax-results">Dataset</a>: MLflow store, per-run metrics, analysis, decision-tree rules and final checkpoints (MIT).</li>
@@ -163,6 +168,11 @@ figcaption, .small { color:var(--muted); font-size:14px; }
   </ul>
   <pre>hf download Pawlo77/wut-murl-craftax-results --repo-type dataset --local-dir craftax-results
 mlflow ui --backend-store-uri sqlite:///craftax-results/mlruns.db</pre>
+  <h3>Hardware</h3>
+  <ul>
+    <li>1M-step runs: an Apple M4 Pro laptop.</li>
+    <li>1B-step runs: the faculty EDEN cluster, one GPU per run. PPO, PPO-RNN and the combination ran on an NVIDIA A100-SXM4-40GB; PQN-RNN and the other additions ran on an NVIDIA H100 PCIe.</li>
+  </ul>
 </section>
 
 <script>
