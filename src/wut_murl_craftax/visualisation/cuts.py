@@ -171,18 +171,56 @@ def _clip_graph(row: Row, layout: str, window: bool) -> str:
     return f"{body},fps={FPS},{up}[g];{panel};{banner},{ffmpeg.BT709}[v]"
 
 
+type Segment = tuple[int, int, float]
+"""(first frame, last frame, speed) of a piece of a master."""
+
+
+def _segments_graph(row: Row, layout: str, segments: Sequence[Segment]) -> str:
+    """Trim each segment at its speed, concatenate, upscale, pad, overlay the panel."""
+    w, h = LAYOUTS[layout].size
+    k, x, y = LAYOUTS[layout].place[row["game"]]
+    n = len(segments)
+    split = f"[0]split={n}" + "".join(f"[s{i}]" for i in range(n)) if n > 1 else "[0]"
+    pieces = [
+        f"[s{i}]trim=start_frame={a}:end_frame={b + 1},setpts=(PTS-STARTPTS)/{v}[t{i}]"
+        for i, (a, b, v) in enumerate(segments)
+    ]
+    join = "".join(f"[t{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0"
+    if n == 1:
+        pieces = [p.replace("[s0]", "[0]", 1) for p in pieces]
+        split, join = "", "[t0]null"
+    up = f"scale=iw*{k}:ih*{k}:flags=neighbor,pad={w}:{h}:{x}:{y}:color=0x121418"
+    panel = ffmpeg.overlay_filter("[g]", "[1]", "[c]")
+    head = [split] if split else []
+    body = f"{join},fps={FPS},{up}[g]"
+    return ";".join([*head, *pieces, body, panel, f"[c]{ffmpeg.BT709}[v]"])
+
+
 def cut_clip(
-    row: Row, layout: str, source: Path, out_dir: Path, window: bool = False
+    row: Row,
+    layout: str,
+    source: Path,
+    out_dir: Path,
+    window: bool = False,
+    segments: Sequence[Segment] | None = None,
 ) -> Path:
     """One kept row -> lossless 60 fps ``<out_dir>/<id>.mp4``.
 
     ``window=True``: ``source`` is a ``render --kept`` window at final size.
+    ``segments``: the clip is these pieces of the master in order (no freeze or banner).
     """
     panel, ban = captions(row, layout, out_dir)
     out = out_dir / f"{row['id']}.mp4"
+    inputs: list[ffmpeg.Arg]
+    if segments:
+        inputs = ["-i", source, "-loop", "1", "-i", panel]
+        graph = _segments_graph(row, layout, segments)
+    else:
+        inputs = [*("-i", source, "-loop", "1", "-i", panel, "-loop", "1", "-i", ban)]
+        graph = _clip_graph(row, layout, window)
     ffmpeg.run([
-        *("-i", source, "-loop", "1", "-i", panel, "-loop", "1", "-i", ban),
-        *("-filter_complex", _clip_graph(row, layout, window), "-map", "[v]"),
+        *inputs,
+        *("-filter_complex", graph, "-map", "[v]"),
         *("-r", str(FPS), *ffmpeg.LOSSLESS_YUV, out),
     ])
     return out

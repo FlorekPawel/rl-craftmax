@@ -329,10 +329,12 @@ def mux_audio(
     voice: Path | None = None,
     music: Path | None = None,
     music_db: float = 0.0,
+    music_fade: float = 4.0,
 ) -> Path:
     """Replace the audio of ``video``: voice-over over ducked music, two-pass loudnorm.
 
-    Without voice and music the track is silent; ``music_db`` lowers the music bed.
+    Without voice and music the track is silent; ``music_db`` lowers the music bed and
+    ``music_fade`` is the length of its fade-out at the end of the video.
     """
     keep_video = ["-map", "0:v", "-c:v", "copy", *AUDIO_OUT, "-shortest", *FASTSTART]
     keep_video += ["-use_editlist", "0", "-avoid_negative_ts", "make_non_negative"]
@@ -352,7 +354,9 @@ def mux_audio(
     fmt = "aformat=sample_rates=48000:channel_layouts=stereo,apad"
     graph = [f"[{i + 1}:a]{fmt}[t{i}]" for i in range(len(tracks))]
     if len(tracks) == 2:
-        graph += [f"[t1]volume={music_db}dB[bed]", "[t0]asplit[v][sc]"]
+        end = max(0.0, duration(video) - music_fade)
+        bed = f"volume={music_db}dB,afade=t=out:st={end:.3f}:d={music_fade}"
+        graph += [f"[t1]{bed}[bed]", "[t0]asplit[v][sc]"]
         graph += [f"[bed][sc]{DUCK}[duck]", "[v][duck]amix=inputs=2:normalize=0[mix]"]
     else:
         graph.append("[t0]acopy[mix]")

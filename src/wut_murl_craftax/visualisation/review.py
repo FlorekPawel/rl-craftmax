@@ -32,6 +32,9 @@ COLUMNS = (
     "seconds",
     "speed",
     "events",
+    "scenes",
+    "brightness",
+    "moving",
 )
 """Review CSV columns; add new ones at the end only (every step reads them by name)."""
 TEMPLATE = Path(__file__).with_name("review_template.html")
@@ -141,14 +144,27 @@ def contact_sheet(
     return sheet
 
 
-def write_page(rows: Sequence[Mapping[str, str]], out_dir: Path, source: str) -> Path:
-    """Copy the static template with the candidates as JSON; the browser adds rows."""
+def write_page(
+    rows: Sequence[Mapping[str, str]],
+    out_dir: Path,
+    source: str,
+    key: str | None = None,
+    needs: Mapping[str, float] | None = None,
+    name: str = "review.html",
+) -> Path:
+    """Copy the static template with the candidates as JSON; the browser adds rows.
+
+    ``key`` names the browser storage of the decisions (default ``source``): pages of
+    one candidate set share their decisions. ``needs`` maps scene -> seconds wanted.
+    """
     data = json.dumps({
         "source": source,
+        "key": key or source,
+        "needs": dict(needs or {}),
         "columns": COLUMNS,
         "rows": [dict(r) for r in rows],
     })
-    page = out_dir / "review.html"
+    page = out_dir / name
     page.write_text(
         TEMPLATE.read_text().replace("__DATA__", data.replace("</", "<\\/"))
     )

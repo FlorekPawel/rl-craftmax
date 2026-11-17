@@ -42,6 +42,6 @@ def test_render_kept_uses_final_tile_size(tmp_path: Path) -> None:
         [row, {**row, "id": "c002", "keep": "drop"}], "land", runs, tmp_path / "hi"
     )
     info = ffmpeg.probe(tmp_path / "hi" / "c001.mkv")["streams"][0]
-    assert (info["width"], info["height"]) == (1008, 1008)  # 112 px per tile = 16 px x7
+    assert (info["width"], info["height"]) == (864, 864)  # 96 px per tile = 16 px x6
     assert ffmpeg.count_frames(tmp_path / "hi" / "c001.mkv") == 8
     assert not (tmp_path / "hi" / "c002.mkv").exists()
