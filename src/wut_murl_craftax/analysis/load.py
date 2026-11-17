@@ -27,7 +27,7 @@ Frames = dict[str, pd.DataFrame]
 METRICS_ROOT = Path("outputs/metrics")
 """Where the exporter writes ``<phase>/<table>.parquet``."""
 TABLES = ("runs", "curves", "eval_episodes")
-FINAL_PHASES = ("final-1m", "final-1b", "combo-1m", "combo-1b")
+FINAL_PHASES = ("final-1m", "final-1b", "combo-1m", "combo-1b", "ablate-1b")
 """The phases of the final analysis; the 1B ones do not exist before the 1B runs."""
 UNIT_COLUMNS = ("method", "config_ref")
 """The statistics unit: never pool two `config_ref` values of one method."""
