@@ -118,3 +118,24 @@ def repo_store_untouched() -> Iterator[None]:
             f"the tests changed the repo's MLflow store ({len(changed)} paths): {shown}"
         )
         raise AssertionError(msg)
+
+
+_GIT_ENV = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_git_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests that run git in a temp repo must not act on the repo that pushed.
+
+    A pre-push hook exports ``GIT_DIR`` and friends; a test's ``git init`` or
+    ``git add`` would then hit the real repository (and may set its ``core.bare``).
+    """
+    for name in _GIT_ENV:
+        monkeypatch.delenv(name, raising=False)

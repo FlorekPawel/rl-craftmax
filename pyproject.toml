@@ -60,6 +60,12 @@ dependencies = [
   "tqdm>=4.67.0",
 ]
 
+[project.optional-dependencies]
+# Publishing the results to Hugging Face (release/publish.py).
+release = [
+  "huggingface_hub>=1.0.0,<2",
+]
+
 [project.urls]
 Homepage = "https://github.com/Pawlo77/rl-craftmax"
 Repository = "https://github.com/Pawlo77/rl-craftmax"
@@ -135,7 +141,7 @@ no_implicit_reexport = true
 disallow_any_generics = true
 
 [[tool.mypy.overrides]]
-module = ['craftax', 'craftax.*', 'optax', 'optax.*', 'mlflow', 'mlflow.*', 'yaml', 'yaml.*', 'pandas', 'pandas.*', 'pyarrow', 'pyarrow.*', 'scipy', 'scipy.*', 'sklearn', 'sklearn.*', 'seaborn', 'seaborn.*']
+module = ['craftax', 'craftax.*', 'optax', 'optax.*', 'mlflow', 'mlflow.*', 'yaml', 'yaml.*', 'pandas', 'pandas.*', 'pyarrow', 'pyarrow.*', 'scipy', 'scipy.*', 'sklearn', 'sklearn.*', 'seaborn', 'seaborn.*', 'huggingface_hub', 'huggingface_hub.*']
 ignore_missing_imports = true
 
 [tool.bandit]
