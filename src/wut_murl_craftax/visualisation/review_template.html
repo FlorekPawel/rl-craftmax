@@ -11,26 +11,32 @@ img,video{image-rendering:pixelated;max-width:100%} video{width:240px}
 .mute{color:var(--mute);font-size:12px} .cap{width:260px}
 .keep{background:var(--keep)} .drop{opacity:.45;background:var(--drop)}
 header{position:sticky;top:0;background:var(--bg);padding:8px 0;z-index:1}
-button{font-size:14px;padding:6px 12px;margin-right:8px}
+button,select{font-size:14px;padding:6px 12px;margin-right:8px}
+.need{display:inline-block;margin:2px 10px 2px 0;font-size:12px;color:var(--mute)} .need.ok{color:#1a7f37;font-weight:600}
+.row.hide{display:none}
 @media (max-width:900px){td{display:block;border:0;padding:4px 0}.row{display:block;border-top:1px solid var(--line)}.cap{width:100%}}
 </style></head><body>
 <header><b id="title"></b> &middot; <span id="n">0</span> kept, <span id="s">0</span> s
-<button id="top">Keep top 10</button><button id="dl">Download review.csv</button></header>
+<button id="top">Keep top 10</button><button id="dl">Download review.csv</button>
+<select id="scene"></select><label><input type="checkbox" id="undecided"> only undecided</label>
+<div id="needs"></div></header>
 <table><tbody id="rows"></tbody></table>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 const D = JSON.parse(document.getElementById('data').textContent);
-const KEY = 'review:' + D.source, SPEEDS = ['0.5', '1', '2', '4', '8'];
+const KEY = 'review:' + (D.key || D.source), SPEEDS = ['0.5', '1', '2', '4', '8'];
 let saved = {}; try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) {}
 const el = (tag, props = {}, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
 function row(r) {
-  Object.assign(r, saved[r.id] || {});
+  const s = saved[r.id] || {};  // an undecided entry never overrides a pre-mark
+  Object.assign(r, s.keep ? s : {caption: s.caption ?? r.caption, speed: s.speed ?? r.speed});
   const tr = el('tr', {className: 'row ' + r.keep});
   const cap = el('input', {className: 'cap', value: r.caption});
   const spd = el('select', {}, ...SPEEDS.map(s => el('option', {selected: s === r.speed}, s)));
   const radio = v => el('label', {}, el('input', {type: 'radio', name: 'k' + r.id, value: v, checked: r.keep === v}), ' ' + v);
   const update = () => { const k = tr.querySelector('input[type=radio]:checked');
     r.keep = k ? k.value : ''; r.caption = cap.value; r.speed = spd.value; tr.className = 'row ' + r.keep; sync(); };
+  tr.dataset.id = r.id;
   tr.addEventListener('input', update); tr.addEventListener('change', update); tr.mark = v => { tr.querySelector(`input[value=${v}]`).checked = true; update(); };
   tr.append(
     el('td', {}, el('b', {}, r.id), el('br'), r.score, el('br'), el('span', {className: 'mute'}, r.type)),
@@ -45,9 +51,25 @@ function sync() {
   document.getElementById('n').textContent = k.length;
   document.getElementById('s').textContent = k.reduce((a, r) => a + r.seconds / r.speed, 0).toFixed(1);
   D.rows.forEach(r => { saved[r.id] = {keep: r.keep, caption: r.caption, speed: r.speed}; });
+  needs(); filter();
   try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) {}
 }
-const trs = D.rows.map(row); document.getElementById('rows').append(...trs);
+const inScene = (r, sc) => !sc || (r.scenes || '').split(' ').includes(sc);
+function needs() {
+  document.getElementById('needs').replaceChildren(...Object.entries(D.needs || {}).map(([sc, want]) => {
+    const got = D.rows.filter(r => r.keep === 'keep' && inScene(r, sc)).reduce((a, r) => a + r.seconds / r.speed, 0);
+    return el('span', {className: 'need' + (got >= want ? ' ok' : '')}, `${sc} ${got.toFixed(0)}/${want} s`);
+  }));
+}
+function filter() {
+  const sc = document.getElementById('scene').value, und = document.getElementById('undecided').checked;
+  trs.forEach((tr, i) => { const r = D.rows[i];
+    tr.classList.toggle('hide', !inScene(r, sc) || (und && r.keep !== '')); });
+}
+const trs = D.rows.map(row);
+const sel = document.getElementById('scene');
+sel.append(el('option', {value: ''}, 'all scenes'), ...Object.keys(D.needs || {}).map(s => el('option', {value: s}, s)));
+sel.onchange = filter; document.getElementById('undecided').onchange = filter; document.getElementById('rows').append(...trs);
 document.getElementById('title').textContent = `${D.rows.length} candidates from ${D.source}`;
 document.getElementById('top').onclick = () => trs.slice(0, 10).forEach(tr => tr.mark('keep'));
 const q = v => /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;

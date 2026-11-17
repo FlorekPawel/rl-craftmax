@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_MASTERS = Path("outputs/visualisation/masters")
 """Default master folder (git-ignored)."""
 FINAL_BPS = {
-    ("land", "craftax"): 80,
+    ("land", "craftax"): 72,
     ("vert", "craftax"): 96,
-    ("land", "classic"): 112,
+    ("land", "classic"): 96,
     ("vert", "classic"): 112,
     ("land4k", "craftax"): 160,
     ("land4k", "classic"): 224,
