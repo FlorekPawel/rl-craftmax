@@ -11,7 +11,6 @@ from wut_murl_craftax.analysis.literature import (
     COMPARABLE_BLOCKS,
     LITERATURE_COLUMNS,
     LITERATURE_CSV,
-    NOTES_DIR,
     comparable_rows,
     load_literature,
 )

@@ -1,7 +1,6 @@
 """Tests for the upgrade checker and applier, with faked ``uv``, ``prek`` and ``gh``."""
 
 import importlib.util
-import json
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType

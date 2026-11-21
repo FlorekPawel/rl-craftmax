@@ -35,5 +35,4 @@ pqn-rnn:
     score: 16.0
     source: https://arxiv.org/abs/2407.04811
     # Auto-Craftax PyTorch PQN-LSTM port, 2.95 / 226 x 100, the only published spread
-    #
     s_pub: 1.31
