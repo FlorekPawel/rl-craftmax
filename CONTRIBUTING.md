@@ -16,7 +16,7 @@ Never commit secrets, tokens or personal data.
 Prerequisites: Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/Pawlo77/rl-craftmax.git
+git clone https://github.com/FlorekPawel/rl-craftmax.git
 cd rl-craftmax
 make install
 ```
@@ -48,4 +48,4 @@ AI tools are welcome. The contributor is responsible for the change: a human rev
 
 ## Questions
 
-Open a GitHub [issue](https://github.com/Pawlo77/rl-craftmax/issues) for usage questions, ideas and bugs.
+Open a GitHub [issue](https://github.com/FlorekPawel/rl-craftmax/issues) for usage questions, ideas and bugs.

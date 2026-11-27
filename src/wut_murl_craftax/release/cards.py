@@ -3,7 +3,7 @@
 
 from pathlib import Path
 
-REPO_URL = "https://github.com/Pawlo77/rl-craftmax"
+REPO_URL = "https://github.com/FlorekPawel/rl-craftmax"
 DATASET_ID = "Pawlo77/wut-murl-craftax-results"
 SPACE_ID = "Pawlo77/wut-murl-craftax"
 
