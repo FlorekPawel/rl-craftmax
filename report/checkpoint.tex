@@ -89,8 +89,6 @@ PQN-RNN & 2\,500 & 7.0 min & 80\,000 & 3.5 h & H100 (65 GB) & 10 h \\
 
 \begin{description}
 \item[Next experiments.] The four additions are what is left. Each one is added to the baselines it fits, run for 1M steps on 10 seeds (a few hours of laptop time) and then for 1B steps on 3 seeds (roughly 10 to 15 GPU-hours per method, like the baselines), and compared with its own unmodified control under the same protocol. The part we are most curious about is the skills, since the skill list is written by hand and may simply be a bad guess. If time allows we also combine the two additions that work best, and run the 1B ablations (Dyna-Q without its exploration bonus, variants of the skill list).
-\item[Deliverables.] A 3-page report, a short and a long video, and a public release of the code, results and a small demo.
-\item[Possible extensions.] Tuning at 1B, more seeds, learning the progress summary instead of choosing it by hand, and the intrinsic-reward baselines RND and E3B.
 \item[Division of work.] Pawe{\l} Pozorski built the baselines, the experiment pipeline and the analysis, and keeps running the 1B jobs on the cluster. Pawe{\l} Florek takes the progress bonus and self-imitation, Jan Cwalina the hand-written skills with Q-learning and Dyna-Q; each of us runs, tunes and describes our own methods. The report sections and the videos follow the same split, and Pawe{\l} Pozorski merges and checks the numbers.
 \end{description}
 
